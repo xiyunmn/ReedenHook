@@ -28,6 +28,8 @@ Desktop.ini
 
 # ---- Local docs (NEVER commit) ----
 local_docs/
+CHANGELOG.md
+TEST_REPORT.md
 
 # ---- Reverse-engineering dumps & target app (huge, not part of the module) ----
 apktool_out/

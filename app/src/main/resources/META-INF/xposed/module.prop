@@ -1,0 +1,11 @@
+id=com.xiyunmn.reedenhook
+name=ReedenHook
+author=xiyunmn
+description=LSPosed module for Reeden (app.reeden). Hybrid Pro unlock: Kwn license publish + field_27 gate pattern scan.
+version=0.4.1
+versionCode=5
+minApiVersion=102
+targetApiVersion=102
+staticScope=true
+exceptionMode=protective
+autoHotReload=true

@@ -1,0 +1,49 @@
+# ---- Build / Gradle ----
+.gradle/
+.kotlin/
+build/
+**/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+*.hprof
+
+# ---- Android artifacts ----
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+
+# ---- OS ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- Local docs (NEVER commit) ----
+local_docs/
+
+# ---- Reverse-engineering dumps & target app (huge, not part of the module) ----
+apktool_out/
+jadx_out/
+blutter_out/
+target_app/
+artifacts/
+
+# ---- IDA / RE working files ----
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# ---- Logs / temp ----
+*.log
+*.tmp

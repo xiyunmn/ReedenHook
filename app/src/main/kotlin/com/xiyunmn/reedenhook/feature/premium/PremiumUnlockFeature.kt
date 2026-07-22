@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * 2. Patch Kwn publication and field_27 gates in the same native install pass
  * 3. Keep Java/Kotlin hooks limited to process lifecycle and native retry orchestration
  *
- * @see local_docs/forged_license_plan.md
+ * @see local_docs/许可证与网络方案.md
  */
 object PremiumUnlockFeature {
     private val probeInstalled = AtomicBoolean(false)

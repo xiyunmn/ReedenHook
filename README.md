@@ -1,194 +1,133 @@
 # ReedenHook
 
-**Version-resilient** LSPosed module for **Reeden** (`app.reeden`) - network/local license primary path with AOT gate fallback.
+ReedenHook 是面向 Reeden 的 LSPosed 模块，用于在本机授权的测试环境中保持会员状态与功能解锁稳定。模块基于现代 libxposed API 102 开发，运行时不需要 root。
 
-**v0.5.2**: network guard plus local forged Hive license as the main path; the native AOT gate scanner is only armed if the local license cannot be kept present.
-
-Stack: **libxposed API 102** (modern LSPosed)
-
-## Host
-
-| Field | Value |
-|---|---|
-| Package | `app.reeden` |
-| Verified version | 1.37.1 (694) |
-| Engine | Flutter / Dart AOT (`3.10.7` baseline) |
-| Main logic | `libapp.so` (AOT) |
-
-## Premium Gate Baseline
-
-Reverse-engineering baseline from Reeden 1.36.1; v0.4.6 discovers current RVAs
-and field-table slots at runtime.
-
-| Item | 1.36.1 baseline |
-|---|---|
-| Pro holder | `CZc` / PurchasesUtil |
-| Singleton | `CZc.Fwn` @ THR slot `0x5268` |
-| Flag | `Fwn+0x27` (`field_27`) |
-| Setter | `0x20F57A4` |
-| Refresh | `CZc.Kwn` `0x2248798` |
-
-Details:
-
-- [local_docs/host_inventory.md](local_docs/host_inventory.md)
-- [local_docs/blutter_premium_analysis.md](local_docs/blutter_premium_analysis.md)
-- [local_docs/czc_pro_state_deep_dive.md](local_docs/czc_pro_state_deep_dive.md)
-- [local_docs/ida_session_libapp.md](local_docs/ida_session_libapp.md)
-
-Constants live in `app/.../host/HostAot.kt`.
-
-## Module layout
+当前主要适配：
 
 ```text
-app/src/main/
-  kotlin/com/xiyunmn/reedenhook/
-    entry/ReedenHookModule.kt     # XposedModule API 102
-    core/HookApi.kt               # only hook installation site
-    host/HostPackages.kt          # app.reeden
-    host/HostAot.kt               # AOT reference constants and lib names
-    feature/premium/              # unlock feature (probe + plan)
-  resources/META-INF/xposed/
-    java_init.list
-    module.prop                   # min/targetApiVersion=102
-    scope.list                    # app.reeden
-  AndroidManifest.xml             # minimal, no classic xposed meta-data
+Reeden 1.37.1 build 694
+app.reeden
 ```
 
-## Build
+当前模块版本：
+
+```text
+ReedenHook 0.5.2
+com.xiyunmn.reedenhook
+```
+
+## 安装
+
+1. 在支持 libxposed API 102 的 LSPosed 中安装并启用模块。
+2. 将作用域只设置为 Reeden（`app.reeden`）。
+3. 强制停止并重新启动 Reeden。
+4. 打开 Reeden 后确认会员状态和会员功能是否保持可用。
+5. 如需排查问题，优先查看模块文件日志。
+
+模块没有独立设置界面；安装、启用作用域并重启宿主后自动生效。
+
+## 主要功能
+
+- 优先通过网络覆写与本地许可证维护保持会员状态。
+- 自动写入、检查并修复宿主本地许可证缓存。
+- 只阻断许可证校验相关域名，不影响宿主其它网络请求。
+- 当主路径无法保持本地许可证存在时，才启用 AOT gate 兜底。
+- 提供宿主私有目录和外部镜像文件日志，便于直接通过 adb 排查。
+
+## 当前策略
+
+模块入口保持单一路径：
+
+```text
+Network override + local license forge -> primary path
+AOT gate -> fallback only
+```
+
+正常运行时，主路径应进入稳定状态，AOT 兜底不应被触发。若日志中出现 `FALLBACK_ARMED` 或 `AOT_GATE_INSTALLED`，说明本地许可证主路径已经被判定失效，需要优先检查许可证文件和网络 guard。
+
+## 使用建议
+
+- 首次安装或升级模块后，先强制停止 Reeden，再重新打开。
+- 宿主版本更新后，请先确认基础启动、会员状态和核心会员功能是否正常。
+- 不建议同时启用其它会修改 Reeden 会员、许可证或网络校验逻辑的模块。
+- 如果会员状态启动后很快回退，优先查看文件日志中的 `local license`、`network guard` 和 `getaddrinfo` 记录。
+- 模块自身不需要 root；root 仅可作为手工取证或一次性测试手段，不属于模块运行路径。
+
+## 日志
+
+logcat 标签：
+
+```text
+ReedenHook
+ReedenHook.Module
+ReedenHook.Network
+ReedenHook.Native
+```
+
+文件日志：
+
+```text
+/data/user/0/app.reeden/files/reedenhook/logs/reedenhook.log
+/sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log
+```
+
+常用查看命令：
+
+```powershell
+adb shell tail -n 160 /sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log
+adb logcat -d -s ReedenHook ReedenHook.Module ReedenHook.Network ReedenHook.Native
+```
+
+正常日志通常会包含：
+
+```text
+NetworkLicenseOverrideFeature.install
+network guard hooked libflutter.so!getaddrinfo
+license getaddrinfo blocked
+local license cache intact
+PRIMARY_STABLE
+```
+
+正常主路径下通常不应出现：
+
+```text
+FALLBACK_ARMED
+AOT_GATE_INSTALLED
+FATAL EXCEPTION
+UnsatisfiedLinkError
+```
+
+## 兼容性
+
+当前真机验证版本为 Reeden 1.37.1 build 694。Reeden 1.36.1 build 684 是逆向分析基线。
+
+跨版本兼容主要依赖以下内容是否保持稳定：
+
+- 许可证域名仍为 `license.reeden.app` 或 `license-cn.reeden.app`。
+- 本地许可证仍存储在 `settings.hive`。
+- 许可证相关键名和 Hive 加密格式没有变化。
+- Flutter / Dart AOT 的兜底门禁结构仍能被唯一识别。
+
+小版本更新通常优先验证主路径；只有主路径失效时才需要重新分析 AOT 兜底。
+
+## 构建
+
+构建需要 JDK 17、Android SDK 和 NDK。推荐使用 PowerShell 7：
 
 ```powershell
 cd E:\AndroidStudioProjects\ReedenHook
 .\gradlew.bat :app:assembleDebug
 ```
 
-Architecture check runs on `:app:preBuild` (`verifyArchitecture`).
-
-## Install / enable
-
-1. Install the APK.
-2. Enable module in LSPosed (modern API).
-3. Scope: **Reeden** only (`app.reeden`, staticScope).
-4. Force-stop / reopen Reeden.
-5. Check logcat: `ReedenHook`.
-6. Check host file logs when logcat is noisy:
-   - Private: `/data/user/0/app.reeden/files/reedenhook/logs/reedenhook.log`
-   - External mirror: `/sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log`
-
-## Status
-
-- [x] Modern API 102 scaffold (libxposed)
-- [x] **v0.4.6 Single Native Scanner**: Kwn publication plus slot-anchored gate fallback
-  - Discovers the `CZc.Fwn` slot from the dominant `field_27` gate cluster
-  - Matches 90 adjacent gates plus 7 delayed/derived gates without hardcoded RVAs
-  - **97 gates patched** (73 TBZ + 24 TBNZ) on Reeden 1.37.1
-- [x] **Version resilience**: instruction and control-flow signatures adapt to AOT layout churn
-  - Ambiguous or missing signatures are skipped instead of patched speculatively
-  - New host versions still require log/feature verification before being declared supported
-- [x] **Functional unlock**: All premium features work (export, search, multi-window, themes)
-- [x] **True device test**: OnePlus PJZ110 / Android 16 / Reeden 1.37.1 verified
-- [x] **Hot reload cleanup**: pending retries are cancelled and every installed native patch is restored
-
-## How unlock works
-
-### v0.4.6 - Single Native Runtime Scanner
-
-Native library `libreeden_unlock.so` (arm64 only) performs smart pattern matching:
-
-1. **Locate target**: Find `libapp.so` base address and size via `dl_iterate_phdr`
-2. **License publication**: Find the unique `Kwn` fallback sequence and force its published value to Dart `true`
-3. **Gate discovery**:
-   - Find adjacent `ldur field_27; decompress; tbz/tbnz #4` gates
-   - Group them by the preceding Dart field-table slot and select the dominant `CZc.Fwn` cluster
-   - Match seven strict supplemental shapes where the value crosses short control flow or a helper call
-4. **Binary patching**: Patch all verified gates:
-   - **TBZ sites**: `tbz wN, #4, <free>` → `b <premium>` (unconditional jump to premium path)
-   - **TBNZ sites**: `tbnz wN, #4, <premium>` → `NOP` (fall through to premium path)
-5. **Verification**: Validate instruction encodings, slot ownership, branch targets, and patch readback
-6. **Cleanup**: Cancel stale retries and restore original code on hot reload
-
-**Why no inline hooks?** Dart AOT uses `x15` as stack pointer (not standard `sp`), making trampoline-based hooks unstable. Direct instruction rewrite is safer.
-
-**Why slot-anchored?** `field_27` and bit 4 are generic Dart boolean shapes. Patching all 357 raw matches corrupts unrelated app logic; the field-table slot and supplemental control-flow signatures identify the `CZc.Fwn` family safely.
-
-**Retry logic**: `packageReady`, `Application.attach`, and `Application.onCreate` all request the same native install ladder. Only one ladder is active per lifecycle generation, so lifecycle probes do not trigger competing hook plans.
-
-### Known limitations
-
-- Native patching is arm64-only.
-- Gate patches provide the cold-start functional fallback. UI license state is synchronized when the app runs the patched `Kwn` publication path.
-- A new host build is accepted only when its runtime signatures remain unambiguous; failure is reported in logcat without broad boolean patching.
-
-### Version History
-
-| Version | Strategy | Resilience | Status |
-|---|---|---|---|
-| v0.1.1 | Hardcoded 99 offsets | ❌ Version-locked | Deprecated |
-| v0.2.0 | Hive forge | ❌ No Java interception layer | Removed |
-| v0.3.0 | Broad runtime scanner | ⚠️ Generic bool false positives | Deprecated |
-| **v0.4.6** | **Single-pass Kwn publication + slot/structure fallback** | **✅ Fail-closed signatures** | **Current** |
-
-See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
-
-Inline hook trampolines are intentionally avoided because Dart AOT uses `x15`
-as its stack pointer. Lifecycle hooks only schedule the single native install
-ladder; there is no separate cache-publisher maintenance loop.
-
-## Build / install
+安装调试包：
 
 ```powershell
-cd E:\AndroidStudioProjects\ReedenHook
-.\gradlew.bat :app:assembleDebug
 adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
-LSPosed: enable module -> scope **Reeden only** -> force-stop Reeden.
+项目会在 `:app:preBuild` 前执行架构检查，确认 libxposed API 102 元数据、作用域和入口配置没有偏离。
 
-```text
-adb logcat -s ReedenHook ReedenHook.Native
-```
 
-File log mirror:
+## 免责声明
 
-```powershell
-adb shell cat /sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log
-```
-
-Expect: 
-```
-I/ReedenHook.Network: NetworkLicenseOverrideFeature.install ... mode=network_local_primary_aot_fallback
-I/ReedenHook.Network: orchestrator state PRIMARY_START -> NETWORK_GUARD_READY ...
-I/ReedenHook.Native: network guard hooked libflutter.so!getaddrinfo ...
-I/ReedenHook.Native: license getaddrinfo blocked #1 host=license.reeden.app ...
-I/ReedenHook.Network: local license cache intact ...
-```
-
-AOT fallback should stay silent during normal runs. If it is needed, the file
-log records `orchestrator state ... -> FALLBACK_ARMED` followed by
-`AOT_GATE_INSTALLED`.
-
-## Cross-Version Compatibility
-
-### Adaptation Strategy
-
-**Pattern stability**: The primary gate pattern is stable across Dart AOT versions:
-- `ldur wN, [xM, #0x27]` - loads `CZc.Fwn.field_27` (Pro boolean flag)
-- `tbz wN, #4, label` or `tbnz wN, #4, label` - tests bit 4 (Dart boolean encoding)
-
-The scanner additionally requires the same field-table slot cluster and validates derived control flow. Compatibility can change if Reeden:
-1. Renames the Pro flag field (unlikely - breaks compatibility)
-2. Switches premium system architecture (major refactor)
-3. Changes Dart AOT codegen fundamentally (requires Flutter upgrade)
-
-**Tested Versions**: 1.36.1 build 684, 1.37.1 build 694 (current device, verified 2026-07-22)
-
-**Expected compatibility**: Minor versions may work without source changes, but must be verified from runtime counts and feature tests. Major versions may require new structural signatures.
-
-### Future Roadmap
-
-| Feature | Priority | Complexity | Benefit |
-|---|---|---|---|
-| Host-signature regression corpus | High | Medium | Verifies scanner coverage before release |
-| Multi-version structural fixtures | Medium | Medium | Detects AOT codegen changes early |
-| Typed network intercept | Low | High | Only revisit if a real Dart response/body object can be preserved |
-
-See [local_docs/后续计划.md](local_docs/后续计划.md) for detailed roadmap.
+使用 LSPosed 模块可能导致宿主异常、功能失效、数据损坏或其它不可预期后果，请在使用前做好备份，并自行承担使用风险。

@@ -1,8 +1,8 @@
 # ReedenHook
 
-**Version-resilient** LSPosed module for **Reeden** (`app.reeden`) - local Pro unlock via one native scanner pass.
+**Version-resilient** LSPosed module for **Reeden** (`app.reeden`) - network/local license primary path with AOT gate fallback.
 
-**v0.4.6**: single native orchestrator with Kwn publication and slot-anchored gate fallback, verified on Reeden 1.37.1, with clean hot-reload rollback.
+**v0.5.2**: network guard plus local forged Hive license as the main path; the native AOT gate scanner is only armed if the local license cannot be kept present.
 
 Stack: **libxposed API 102** (modern LSPosed)
 
@@ -155,11 +155,16 @@ adb shell cat /sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.l
 
 Expect: 
 ```
-I/ReedenHook.Network: NetworkLicenseOverrideFeature.install ... mode=network_response_override
+I/ReedenHook.Network: NetworkLicenseOverrideFeature.install ... mode=network_local_primary_aot_fallback
+I/ReedenHook.Network: orchestrator state PRIMARY_START -> NETWORK_GUARD_READY ...
 I/ReedenHook.Native: network guard hooked libflutter.so!getaddrinfo ...
 I/ReedenHook.Native: license getaddrinfo blocked #1 host=license.reeden.app ...
 I/ReedenHook.Network: local license cache intact ...
 ```
+
+AOT fallback should stay silent during normal runs. If it is needed, the file
+log records `orchestrator state ... -> FALLBACK_ARMED` followed by
+`AOT_GATE_INSTALLED`.
 
 ## Cross-Version Compatibility
 

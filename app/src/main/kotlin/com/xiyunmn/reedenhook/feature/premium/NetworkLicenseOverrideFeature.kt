@@ -36,9 +36,9 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * Network-first license override.
  *
- * This deliberately avoids Dart AOT/native patching. It only rewrites Java URL
- * stack responses for Reeden's license hosts, and logs every matched URL so we
- * can distinguish a Java-network hit from a Dart-native network path.
+ * Primary path: block/override license networking and keep a valid local Hive
+ * license cache. The legacy Dart AOT gate scanner is only armed as a narrow
+ * fallback when the primary path cannot keep any license record present.
  */
 object NetworkLicenseOverrideFeature {
     private const val TAG = "ReedenHook.Network"
@@ -52,6 +52,8 @@ object NetworkLicenseOverrideFeature {
     private const val HIVE_KEY_STRING_TYPE = 0x01
     private const val LOCAL_REPAIR_MIN_INTERVAL_MS = 200L
     private const val LOCAL_POLL_INTERVAL_MS = 2_500L
+    private const val AOT_FALLBACK_MIN_MISSING_CHECKS = 3
+    private const val AOT_FALLBACK_MIN_MISSING_AGE_MS = 4_000L
     private const val LOCAL_WATCH_MASK =
         FileObserver.CLOSE_WRITE or
             FileObserver.CREATE or
@@ -72,8 +74,18 @@ object NetworkLicenseOverrideFeature {
     private val localRepairWrites = AtomicInteger(0)
     private val localRepairSkips = AtomicInteger(0)
     private val networkGuardStarted = AtomicBoolean(false)
+    private val orchestratorLock = Any()
+    private val primaryMissingFailures = AtomicInteger(0)
+    private val aotFallbackArmed = AtomicBoolean(false)
+    private val aotFallbackInstallStarted = AtomicBoolean(false)
+    private val aotFallbackInstalled = AtomicBoolean(false)
+    private val aotFallbackGeneration = AtomicInteger(0)
     private var localLastRepairAt = 0L
     private var localBackupDone = false
+    @Volatile
+    private var primaryFirstMissingAt = 0L
+    @Volatile
+    private var orchestratorState = OrchestratorState.PRIMARY_START
     private var localObserver: FileObserver? = null
     private val targetConnections = Collections.synchronizedMap(WeakHashMap<Any, String>())
     private val requestBodies = Collections.synchronizedMap(WeakHashMap<Any, ByteArrayOutputStream>())
@@ -89,7 +101,7 @@ object NetworkLicenseOverrideFeature {
         }
         HookApi.i(
             "NetworkLicenseOverrideFeature.install process=${HostPackages.processLabel(processName)}, " +
-                "mode=network_response_override hosts=${targetHosts.joinToString(",")}",
+                "mode=network_local_primary_aot_fallback hosts=${targetHosts.joinToString(",")}",
             TAG,
         )
         startNativeNetworkGuard("feature.install")
@@ -127,7 +139,16 @@ object NetworkLicenseOverrideFeature {
         localObserver = null
         localGuardianStarted.set(false)
         networkGuardStarted.set(false)
+        primaryMissingFailures.set(0)
+        primaryFirstMissingAt = 0L
+        aotFallbackArmed.set(false)
+        aotFallbackInstallStarted.set(false)
+        aotFallbackInstalled.set(false)
+        aotFallbackGeneration.incrementAndGet()
         NativeNetworkGuard.setEnabled(false)
+        NativePremiumUnlock.setEnabled(false)
+        NativePremiumUnlock.uninstall()
+        transitionTo(OrchestratorState.PRIMARY_START, "hotReload.cleanup")
         synchronized(localRepairLock) {
             localLastRepairAt = 0L
             localBackupDone = false
@@ -170,7 +191,7 @@ object NetworkLicenseOverrideFeature {
         val logPaths = HookApi.configureHostFileLogging(appContext, reason)
         NativeNetworkGuard.configureFileLogging(logPaths)
         startNativeNetworkGuard(reason)
-        repairLocalLicense(appContext, "$reason.immediate")
+        handleLocalLicenseCheck(appContext, "$reason.immediate")
         if (!localGuardianStarted.compareAndSet(false, true)) {
             return
         }
@@ -184,14 +205,14 @@ object NetworkLicenseOverrideFeature {
                     if (!NativeNetworkGuard.isInstalled()) {
                         startNativeNetworkGuard("guardian.early.$index.${delayMs}ms")
                     }
-                    repairLocalLicense(appContext, "guardian.early.$index.${delayMs}ms")
+                    handleLocalLicenseCheck(appContext, "guardian.early.$index.${delayMs}ms")
                 }
                 while (localGuardianStarted.get()) {
                     runCatching { Thread.sleep(LOCAL_POLL_INTERVAL_MS) }
                     if (!NativeNetworkGuard.isInstalled()) {
                         startNativeNetworkGuard("guardian.poll")
                     }
-                    repairLocalLicense(appContext, "guardian.poll")
+                    handleLocalLicenseCheck(appContext, "guardian.poll")
                 }
             },
             "ReedenHook-LicenseGuardian",
@@ -204,12 +225,16 @@ object NetworkLicenseOverrideFeature {
 
     private fun startNativeNetworkGuard(reason: String) {
         if (NativeNetworkGuard.isInstalled()) {
+            onNetworkGuardReady(reason)
             return
         }
         if (!networkGuardStarted.compareAndSet(false, true)) {
             val code = NativeNetworkGuard.install("$reason.retry")
             if (code != -1 && code != -3) {
                 networkGuardStarted.set(NativeNetworkGuard.isInstalled())
+            }
+            if (code == 0 || NativeNetworkGuard.isInstalled()) {
+                onNetworkGuardReady("$reason.retry")
             }
             return
         }
@@ -222,6 +247,7 @@ object NetworkLicenseOverrideFeature {
                     }
                     val code = NativeNetworkGuard.install("$reason.native.$index")
                     if (code == 0 || NativeNetworkGuard.isInstalled()) {
+                        onNetworkGuardReady("$reason.native.$index")
                         return@Thread
                     }
                 }
@@ -250,7 +276,7 @@ object NetworkLicenseOverrideFeature {
                 if ((event and LOCAL_WATCH_MASK) == 0) {
                     return
                 }
-                repairLocalLicense(context, "FileObserver.event=0x${event.toString(16)}")
+                handleLocalLicenseCheck(context, "FileObserver.event=0x${event.toString(16)}")
             }
         }
         localObserver = observer
@@ -259,18 +285,30 @@ object NetworkLicenseOverrideFeature {
             .onFailure { HookApi.w("local license observer failed: ${it.message}", TAG) }
     }
 
-    private fun repairLocalLicense(context: Context?, reason: String) {
-        if (context == null || context.packageName != HostPackages.TARGET) {
-            return
+    private fun handleLocalLicenseCheck(context: Context?, reason: String) {
+        val appContext = context?.applicationContext ?: context
+        val result = repairLocalLicense(appContext, reason)
+        if (appContext != null && appContext.packageName == HostPackages.TARGET) {
+            handlePrimaryLicenseResult(result)
         }
-        synchronized(localRepairLock) {
+    }
+
+    private fun repairLocalLicense(context: Context?, reason: String): LocalLicenseResult {
+        if (context == null || context.packageName != HostPackages.TARGET) {
+            return LocalLicenseResult.skipped(reason, null, "invalid_context")
+        }
+        return synchronized(localRepairLock) {
             localRepairChecks.incrementAndGet()
+            val hiveFile = hiveFileFor(context)
             val nowMs = System.currentTimeMillis()
             if (nowMs - localLastRepairAt < LOCAL_REPAIR_MIN_INTERVAL_MS) {
-                return
+                return@synchronized LocalLicenseResult.skipped(
+                    reason = reason,
+                    path = hiveFile.absolutePath,
+                    cause = "rate_limited",
+                )
             }
             runCatching {
-                val hiveFile = hiveFileFor(context)
                 val parent = hiveFile.parentFile
                 if (parent != null && !parent.exists() && !parent.mkdirs()) {
                     error("cannot create ${parent.absolutePath}")
@@ -288,7 +326,14 @@ object NetworkLicenseOverrideFeature {
                             TAG,
                         )
                     }
-                    return
+                    return@runCatching LocalLicenseResult(
+                        status = LocalLicenseStatus.VALID,
+                        reason = reason,
+                        path = hiveFile.absolutePath,
+                        cause = "intact",
+                        licenseMissingAfterAttempt = false,
+                        inspection = inspection,
+                    )
                 }
 
                 if (hiveFile.exists() && !localBackupDone) {
@@ -319,6 +364,31 @@ object NetworkLicenseOverrideFeature {
                     }
                 }
                 val writes = localRepairWrites.incrementAndGet()
+                val repairedData = hiveFile.readBytes()
+                val repairedInspection = inspectHive(repairedData)
+                if (!repairedInspection.completeForgedState ||
+                    repairedInspection.validPrefixLength != repairedData.size
+                ) {
+                    val missingAfterWrite = repairedInspection.licenseMissingOrDeleted
+                    HookApi.w(
+                        "local license repair verification pending #$writes reason=$reason " +
+                            "cause=${inspection.repairCause} postCause=${repairedInspection.repairCause} " +
+                            "licenseMissing=$missingAfterWrite path=${hiveFile.absolutePath}",
+                        TAG,
+                    )
+                    return@runCatching LocalLicenseResult(
+                        status = if (missingAfterWrite) {
+                            LocalLicenseStatus.FAILED
+                        } else {
+                            LocalLicenseStatus.PENDING_RETRY
+                        },
+                        reason = reason,
+                        path = hiveFile.absolutePath,
+                        cause = repairedInspection.repairCause,
+                        licenseMissingAfterAttempt = missingAfterWrite,
+                        inspection = repairedInspection,
+                    )
+                }
                 localLastRepairAt = nowMs
                 HookApi.i(
                     "local license repaired #$writes reason=$reason cause=${inspection.repairCause} " +
@@ -327,10 +397,205 @@ object NetworkLicenseOverrideFeature {
                         "path=${hiveFile.absolutePath}",
                     TAG,
                 )
-            }.onFailure { throwable ->
+                LocalLicenseResult(
+                    status = LocalLicenseStatus.REPAIRED,
+                    reason = reason,
+                    path = hiveFile.absolutePath,
+                    cause = inspection.repairCause,
+                    licenseMissingAfterAttempt = false,
+                    inspection = repairedInspection,
+                )
+            }.getOrElse { throwable ->
+                val failureInspection = runCatching {
+                    if (hiveFile.exists()) {
+                        inspectHive(hiveFile.readBytes())
+                    } else {
+                        inspectHive(ByteArray(0))
+                    }
+                }.getOrNull()
+                val licenseMissing = failureInspection?.licenseMissingOrDeleted ?: !hiveFile.exists()
                 HookApi.e("local license repair failed reason=$reason", TAG, throwable)
+                LocalLicenseResult(
+                    status = LocalLicenseStatus.FAILED,
+                    reason = reason,
+                    path = hiveFile.absolutePath,
+                    cause = failureInspection?.repairCause ?: (throwable.message ?: throwable.javaClass.name),
+                    licenseMissingAfterAttempt = licenseMissing,
+                    inspection = failureInspection,
+                    throwable = throwable,
+                )
             }
         }
+    }
+
+    private fun handlePrimaryLicenseResult(result: LocalLicenseResult) {
+        when (result.status) {
+            LocalLicenseStatus.VALID,
+            LocalLicenseStatus.REPAIRED -> {
+                val previousFailures = primaryMissingFailures.getAndSet(0)
+                primaryFirstMissingAt = 0L
+                if (!aotFallbackInstalled.get()) {
+                    aotFallbackArmed.set(false)
+                    aotFallbackGeneration.incrementAndGet()
+                }
+                if (previousFailures > 0) {
+                    HookApi.i(
+                        "primary license recovered reason=${result.reason} " +
+                            "previousMissingFailures=$previousFailures cause=${result.cause}",
+                        TAG,
+                    )
+                }
+                val nextState = if (NativeNetworkGuard.isInstalled()) {
+                    OrchestratorState.PRIMARY_STABLE
+                } else {
+                    OrchestratorState.LOCAL_LICENSE_VALID
+                }
+                if (!aotFallbackInstalled.get()) {
+                    transitionTo(nextState, "license.${result.status.name.lowercase(Locale.US)}.${result.reason}")
+                }
+            }
+            LocalLicenseStatus.PENDING_RETRY,
+            LocalLicenseStatus.SKIPPED -> Unit
+            LocalLicenseStatus.FAILED -> {
+                if (result.licenseMissingAfterAttempt) {
+                    notePrimaryLicenseMissing(result)
+                } else {
+                    primaryMissingFailures.set(0)
+                    primaryFirstMissingAt = 0L
+                    HookApi.w(
+                        "primary license repair failed but license is not missing; " +
+                            "AOT fallback not armed reason=${result.reason} cause=${result.cause}",
+                        TAG,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun onNetworkGuardReady(reason: String) {
+        if (aotFallbackInstalled.get()) {
+            return
+        }
+        val nextState = when (orchestratorState) {
+            OrchestratorState.LOCAL_LICENSE_VALID,
+            OrchestratorState.PRIMARY_STABLE -> OrchestratorState.PRIMARY_STABLE
+            else -> OrchestratorState.NETWORK_GUARD_READY
+        }
+        transitionTo(nextState, "networkGuard.$reason")
+    }
+
+    private fun notePrimaryLicenseMissing(result: LocalLicenseResult) {
+        if (aotFallbackInstalled.get()) {
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        if (primaryFirstMissingAt == 0L) {
+            primaryFirstMissingAt = nowMs
+        }
+        val count = primaryMissingFailures.incrementAndGet()
+        val ageMs = nowMs - primaryFirstMissingAt
+        val readyForFallback =
+            count >= AOT_FALLBACK_MIN_MISSING_CHECKS &&
+                ageMs >= AOT_FALLBACK_MIN_MISSING_AGE_MS
+        HookApi.w(
+            "primary license missing after repair reason=${result.reason} cause=${result.cause} " +
+                "count=$count ageMs=$ageMs fallback=${if (readyForFallback) "arming" else "waiting"}",
+            TAG,
+        )
+        if (readyForFallback) {
+            armAotFallback(
+                reason = "license_missing count=$count ageMs=$ageMs cause=${result.cause}",
+            )
+        }
+    }
+
+    private fun armAotFallback(reason: String) {
+        if (aotFallbackInstalled.get()) {
+            return
+        }
+        aotFallbackArmed.set(true)
+        transitionTo(OrchestratorState.FALLBACK_ARMED, reason)
+        startAotFallbackInstall(reason, aotFallbackGeneration.get())
+    }
+
+    private fun startAotFallbackInstall(reason: String, generation: Int) {
+        if (!aotFallbackInstallStarted.compareAndSet(false, true)) {
+            return
+        }
+        Thread(
+            {
+                try {
+                    val attempts = longArrayOf(0L, 500L, 1_500L, 3_000L, 5_000L)
+                    attempts.forEachIndexed { index, delayMs ->
+                        if (delayMs > 0) {
+                            runCatching { Thread.sleep(delayMs) }
+                        }
+                        if (!isAotFallbackStillArmed(generation)) {
+                            HookApi.i("AOT fallback cancelled reason=$reason generation=$generation", TAG)
+                            return@Thread
+                        }
+                        if (!isLibLoaded(HostAot.LIB_APP)) {
+                            HookApi.w("AOT fallback waiting for ${HostAot.LIB_APP} reason=$reason attempt=$index", TAG)
+                            return@forEachIndexed
+                        }
+                        if (!NativePremiumUnlock.ensureLoaded()) {
+                            HookApi.e("AOT fallback native load failed reason=$reason attempt=$index", TAG)
+                            return@forEachIndexed
+                        }
+                        val code = NativePremiumUnlock.install()
+                        val installedNow = NativePremiumUnlock.isInstalled()
+                        if (installedNow) {
+                            aotFallbackInstalled.set(true)
+                            NativePremiumUnlock.setEnabled(true)
+                            transitionTo(
+                                OrchestratorState.AOT_GATE_INSTALLED,
+                                "reason=$reason attempt=$index code=$code status=${NativePremiumUnlock.status()}",
+                            )
+                            return@Thread
+                        }
+                        HookApi.e("AOT fallback install failed reason=$reason attempt=$index code=$code", TAG)
+                    }
+                    if (isAotFallbackStillArmed(generation) && !aotFallbackInstalled.get()) {
+                        HookApi.e(
+                            "AOT fallback exhausted reason=$reason status=${NativePremiumUnlock.status()} " +
+                                "log=${HookApi.currentFileLogPaths().externalPath ?: HookApi.currentFileLogPaths().privatePath}",
+                            TAG,
+                        )
+                    }
+                } finally {
+                    if (!aotFallbackInstalled.get()) {
+                        aotFallbackInstallStarted.set(false)
+                    }
+                }
+            },
+            "ReedenHook-AotFallback",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun isAotFallbackStillArmed(generation: Int): Boolean {
+        return aotFallbackArmed.get() &&
+            generation == aotFallbackGeneration.get() &&
+            !aotFallbackInstalled.get()
+    }
+
+    private fun transitionTo(next: OrchestratorState, reason: String) {
+        synchronized(orchestratorLock) {
+            val previous = orchestratorState
+            if (previous == next) {
+                return
+            }
+            orchestratorState = next
+            HookApi.i("orchestrator state $previous -> $next reason=$reason", TAG)
+        }
+    }
+
+    private fun isLibLoaded(name: String): Boolean {
+        return runCatching {
+            File("/proc/self/maps").readText().contains(name)
+        }.getOrDefault(false)
     }
 
     private fun hiveFileFor(context: Context): File {
@@ -571,6 +836,7 @@ object NetworkLicenseOverrideFeature {
     private fun inspectHive(data: ByteArray): HiveInspection {
         var offset = 0
         var frameCount = 0
+        var latestLicenseSeen = false
         var latestLicenseLooksValid = false
         var latestLicenseDeleted = false
         var latestLicenseKeyLooksValid = false
@@ -594,6 +860,7 @@ object NetworkLicenseOverrideFeature {
             val deleted = keyInfo.valueOffset == valueEnd
             when (keyInfo.key) {
                 "license" -> {
+                    latestLicenseSeen = true
                     latestLicenseDeleted = deleted
                     latestLicenseLooksValid = false
                     if (!deleted) {
@@ -651,6 +918,7 @@ object NetworkLicenseOverrideFeature {
         return HiveInspection(
             validPrefixLength = offset,
             frameCount = frameCount,
+            latestLicenseSeen = latestLicenseSeen,
             latestLicenseLooksValid = latestLicenseLooksValid,
             latestLicenseDeleted = latestLicenseDeleted,
             latestLicenseKeyLooksValid = latestLicenseKeyLooksValid,
@@ -887,9 +1155,50 @@ object NetworkLicenseOverrideFeature {
         }
     }
 
+    private enum class OrchestratorState {
+        PRIMARY_START,
+        NETWORK_GUARD_READY,
+        LOCAL_LICENSE_VALID,
+        PRIMARY_STABLE,
+        FALLBACK_ARMED,
+        AOT_GATE_INSTALLED,
+    }
+
+    private enum class LocalLicenseStatus {
+        VALID,
+        REPAIRED,
+        PENDING_RETRY,
+        FAILED,
+        SKIPPED,
+    }
+
+    private data class LocalLicenseResult(
+        val status: LocalLicenseStatus,
+        val reason: String,
+        val path: String?,
+        val cause: String,
+        val licenseMissingAfterAttempt: Boolean,
+        val inspection: HiveInspection?,
+        val throwable: Throwable? = null,
+    ) {
+        companion object {
+            fun skipped(reason: String, path: String?, cause: String): LocalLicenseResult {
+                return LocalLicenseResult(
+                    status = LocalLicenseStatus.SKIPPED,
+                    reason = reason,
+                    path = path,
+                    cause = cause,
+                    licenseMissingAfterAttempt = false,
+                    inspection = null,
+                )
+            }
+        }
+    }
+
     private data class HiveInspection(
         val validPrefixLength: Int,
         val frameCount: Int,
+        val latestLicenseSeen: Boolean,
         val latestLicenseLooksValid: Boolean,
         val latestLicenseDeleted: Boolean,
         val latestLicenseKeyLooksValid: Boolean,
@@ -907,12 +1216,17 @@ object NetworkLicenseOverrideFeature {
                     latestFailedCountLooksValid &&
                     latestAccessTokenLooksValid
 
+        val licenseMissingOrDeleted: Boolean
+            get() = !latestLicenseSeen || latestLicenseDeleted
+
         val repairCause: String
             get() = buildList {
-                if (latestLicenseDeleted) {
+                if (!latestLicenseSeen) {
+                    add("license_missing")
+                } else if (latestLicenseDeleted) {
                     add("license_deleted")
                 } else if (!latestLicenseLooksValid) {
-                    add("license_missing_or_invalid")
+                    add("license_invalid")
                 }
                 if (!latestLicenseKeyLooksValid) add("license_key")
                 if (!latestEmailLooksValid) add("license.email")

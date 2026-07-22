@@ -1359,6 +1359,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
-    LOGI("JNI_OnLoad reeden_unlock v0.5.1 network guard available");
+    LOGI("JNI_OnLoad reeden_unlock v0.5.2 network guard with AOT fallback available");
     return JNI_VERSION_1_6;
 }

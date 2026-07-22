@@ -1,9 +1,9 @@
 id=com.xiyunmn.reedenhook
 name=ReedenHook
 author=xiyunmn
-description=LSPosed module for Reeden (app.reeden). Network-first license response override with host file logs, no root.
-version=0.5.1
-versionCode=12
+description=LSPosed module for Reeden (app.reeden). Network/local license primary with AOT fallback, no root.
+version=0.5.2
+versionCode=13
 minApiVersion=102
 targetApiVersion=102
 staticScope=true

@@ -16,8 +16,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Modern libxposed API 102 entry for Reeden (app.reeden).
  *
- * Competition mode is network-first: install only the Java URL/HTTP response
- * override path and keep native Dart AOT patching out of the active hook graph.
+ * Competition mode is network-first: keep networking/local license as the
+ * active path and let the network feature arm AOT gates only as fallback.
  */
 class ReedenHookModule : XposedModule() {
     private var processName: String = ""
@@ -64,7 +64,8 @@ class ReedenHookModule : XposedModule() {
 
         HookApi.i(
             "Target ready: package=${param.packageName}, process=$processName, " +
-                "classLoader=${param.classLoader}, dartBaseline=${HostAot.DART_VERSION}, mode=network_response_override",
+                "classLoader=${param.classLoader}, dartBaseline=${HostAot.DART_VERSION}, " +
+                "mode=network_local_primary_aot_fallback",
         )
         hostClassLoader = param.classLoader
         NetworkLicenseOverrideFeature.install(this, param.classLoader, processName)

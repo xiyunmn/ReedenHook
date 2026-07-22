@@ -1,22 +1,18 @@
-# Keep the libxposed entry point referenced from META-INF/xposed/java_init.list.
+# Keep only the framework/JNI names that are resolved outside normal bytecode.
 -dontwarn io.github.libxposed.annotation.**
 -dontwarn io.github.libxposed.api.**
 
 -adaptresourcefilecontents META-INF/xposed/java_init.list
 
--keep,allowoptimization,allowobfuscation public class * extends io.github.libxposed.api.XposedModule {
+-keep,allowoptimization class com.xiyunmn.reedenhook.entry.ReedenHookModule {
     public <init>();
 }
 
--keep class com.xiyunmn.reedenhook.entry.ReedenHookModule {
-    public <init>();
+# Static JNI exports in libreeden_unlock.so use these exact class and method names.
+-keep,allowoptimization class com.xiyunmn.reedenhook.feature.premium.NativePremiumUnlock {
+    private native <methods>;
 }
 
-# Host package / AOT offset constants used by premium feature stubs.
--keep class com.xiyunmn.reedenhook.host.** { *; }
--keep class com.xiyunmn.reedenhook.feature.premium.** { *; }
-
-# JNI bridge for native unlock.
--keep class com.xiyunmn.reedenhook.feature.premium.NativePremiumUnlock {
-    *;
+-keep,allowoptimization class com.xiyunmn.reedenhook.feature.premium.NativeNetworkGuard {
+    private native <methods>;
 }

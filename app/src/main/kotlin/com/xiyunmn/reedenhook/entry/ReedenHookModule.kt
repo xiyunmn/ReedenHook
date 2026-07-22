@@ -2,7 +2,7 @@ package com.xiyunmn.reedenhook.entry
 
 import android.util.Log
 import com.xiyunmn.reedenhook.core.HookApi
-import com.xiyunmn.reedenhook.feature.premium.PremiumUnlockFeature
+import com.xiyunmn.reedenhook.feature.premium.NetworkLicenseOverrideFeature
 import com.xiyunmn.reedenhook.host.HostAot
 import com.xiyunmn.reedenhook.host.HostPackages
 import io.github.libxposed.api.XposedModule
@@ -16,11 +16,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Modern libxposed API 102 entry for Reeden (app.reeden).
  *
- * Premium unlock is Dart AOT based (libapp.so). This entry installs lifecycle
- * probes and defers the real unlock path to [PremiumUnlockFeature].
+ * Competition mode is network-first: install only the Java URL/HTTP response
+ * override path and keep native Dart AOT patching out of the active hook graph.
  */
 class ReedenHookModule : XposedModule() {
     private var processName: String = ""
+    private var hostClassLoader: ClassLoader? = null
     private val installed = AtomicBoolean(false)
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
@@ -63,9 +64,10 @@ class ReedenHookModule : XposedModule() {
 
         HookApi.i(
             "Target ready: package=${param.packageName}, process=$processName, " +
-                "classLoader=${param.classLoader}, dartBaseline=${HostAot.DART_VERSION}",
+                "classLoader=${param.classLoader}, dartBaseline=${HostAot.DART_VERSION}, mode=network_response_override",
         )
-        PremiumUnlockFeature.install(this, param.classLoader, processName)
+        hostClassLoader = param.classLoader
+        NetworkLicenseOverrideFeature.install(this, param.classLoader, processName)
     }
 
     override fun onHotReloading(param: HotReloadingParam): Boolean {
@@ -73,7 +75,7 @@ class ReedenHookModule : XposedModule() {
             "Hot reload requested: process=${HostPackages.processLabel(processName)}, " +
                 "installed=${installed.get()}",
         )
-        PremiumUnlockFeature.onHotReloading()
+        NetworkLicenseOverrideFeature.onHotReloading()
         installed.set(false)
         HookApi.detach(this)
         return true
@@ -89,7 +91,17 @@ class ReedenHookModule : XposedModule() {
         // Re-install happens on next package-ready style path if host re-invokes;
         // for API 102 hot reload we re-run feature install when still in target process.
         if (HostPackages.isMainProcess(processName) && installed.compareAndSet(false, true)) {
-            PremiumUnlockFeature.installAfterHotReload(this, processName, param.oldHookHandles)
+            val classLoader = hostClassLoader ?: ReedenHookModule::class.java.classLoader
+            if (classLoader == null) {
+                HookApi.e("Hot reload skipped: missing classLoader")
+            } else {
+                NetworkLicenseOverrideFeature.installAfterHotReload(
+                    this,
+                    classLoader,
+                    processName,
+                    param.oldHookHandles,
+                )
+            }
         }
     }
 

@@ -1,9 +1,9 @@
 id=com.xiyunmn.reedenhook
 name=ReedenHook
 author=xiyunmn
-description=LSPosed module for Reeden (app.reeden). Single-pass native Pro unlock: Kwn publication + field_27 gate fallback.
-version=0.4.6
-versionCode=10
+description=LSPosed module for Reeden (app.reeden). Network-first license response override, no root.
+version=0.5.0
+versionCode=11
 minApiVersion=102
 targetApiVersion=102
 staticScope=true

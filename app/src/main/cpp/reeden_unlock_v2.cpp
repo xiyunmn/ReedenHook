@@ -1,24 +1,145 @@
 #include <android/log.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <jni.h>
 #include <link.h>
+#include <netdb.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <cstring>
 #include <mutex>
 #include <vector>
 
 #define LOG_TAG "ReedenHook.Native"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
+
+constexpr size_t kNativeLogPathCount = 2;
+constexpr size_t kNativeLogPathMax = 512;
+constexpr size_t kNativeLogLineMax = 1536;
+constexpr off_t kNativeLogMaxBytes = 512 * 1024;
+
+std::mutex g_native_log_mu;
+char g_native_log_paths[kNativeLogPathCount][kNativeLogPathMax] = {};
+
+pid_t current_tid() {
+    return static_cast<pid_t>(syscall(__NR_gettid));
+}
+
+void write_all(int fd, const char *data, size_t len) {
+    while (len > 0) {
+        const ssize_t written = write(fd, data, len);
+        if (written <= 0) {
+            return;
+        }
+        data += written;
+        len -= static_cast<size_t>(written);
+    }
+}
+
+void rotate_native_log_if_needed(const char *path, size_t incoming_bytes) {
+    struct stat st {};
+    if (stat(path, &st) != 0 ||
+        st.st_size + static_cast<off_t>(incoming_bytes) <= kNativeLogMaxBytes) {
+        return;
+    }
+    char backup[kNativeLogPathMax + 4] {};
+    const int len = snprintf(backup, sizeof(backup), "%s.1", path);
+    if (len <= 0 || static_cast<size_t>(len) >= sizeof(backup)) {
+        return;
+    }
+    unlink(backup);
+    rename(path, backup);
+}
+
+void append_native_file_log(const char *level, const char *message) {
+    char paths[kNativeLogPathCount][kNativeLogPathMax] {};
+    {
+        std::lock_guard<std::mutex> lock(g_native_log_mu);
+        for (size_t i = 0; i < kNativeLogPathCount; ++i) {
+            snprintf(paths[i], sizeof(paths[i]), "%s", g_native_log_paths[i]);
+        }
+    }
+
+    bool has_path = false;
+    for (size_t i = 0; i < kNativeLogPathCount; ++i) {
+        if (paths[i][0] != '\0') {
+            has_path = true;
+            break;
+        }
+    }
+    if (!has_path) {
+        return;
+    }
+
+    struct timespec ts {};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm_value {};
+    localtime_r(&ts.tv_sec, &tm_value);
+    char stamp[32] {};
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_value);
+
+    char line[kNativeLogLineMax] {};
+    const int line_len = snprintf(
+        line,
+        sizeof(line),
+        "%s.%03ld %s/%s(%d:%d): %s\n",
+        stamp,
+        ts.tv_nsec / 1000000L,
+        level,
+        LOG_TAG,
+        getpid(),
+        current_tid(),
+        message ? message : "");
+    if (line_len <= 0) {
+        return;
+    }
+    const size_t bytes =
+        static_cast<size_t>(line_len) < sizeof(line) ?
+        static_cast<size_t>(line_len) :
+        sizeof(line) - 1;
+
+    std::lock_guard<std::mutex> lock(g_native_log_mu);
+    for (size_t i = 0; i < kNativeLogPathCount; ++i) {
+        const char *path = g_native_log_paths[i];
+        if (path[0] == '\0') {
+            continue;
+        }
+        rotate_native_log_if_needed(path, bytes);
+        const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            continue;
+        }
+        write_all(fd, line, bytes);
+        close(fd);
+    }
+}
+
+void log_message(int priority, const char *level, const char *fmt, ...) {
+    char message[1024] {};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    __android_log_print(priority, LOG_TAG, "%s", message);
+    append_native_file_log(level, message);
+}
+
+#define LOGI(...) log_message(ANDROID_LOG_INFO, "I", __VA_ARGS__)
+#define LOGW(...) log_message(ANDROID_LOG_WARN, "W", __VA_ARGS__)
+#define LOGE(...) log_message(ANDROID_LOG_ERROR, "E", __VA_ARGS__)
 
 // Single-pass native unlock strategy (v0.4.6):
 //
@@ -40,6 +161,7 @@ namespace {
 // chain proved brittle under runtime return-shape changes.
 
 constexpr const char *kLibApp = "libapp.so";
+constexpr const char *kLibFlutter = "libflutter.so";
 constexpr const char *kMode = "single_pass_gate_scan";
 constexpr uint32_t kNop = 0xD503201Fu;
 constexpr uint32_t kDartFalseOffset = 0x30u;
@@ -97,6 +219,246 @@ void *g_libapp_base = nullptr;
 size_t g_libapp_size = 0;
 uintptr_t g_license_publish_rva = 0;
 std::vector<Patch> g_patches;
+
+using GetAddrInfoFn = int (*)(
+    const char *node,
+    const char *service,
+    const struct addrinfo *hints,
+    struct addrinfo **res);
+
+std::atomic<bool> g_network_guard_enabled{true};
+std::atomic<bool> g_network_guard_installed{false};
+std::atomic<int> g_network_guard_hits{0};
+std::atomic<int> g_network_guard_attempts{0};
+void **g_getaddrinfo_slot = nullptr;
+GetAddrInfoFn g_real_getaddrinfo = nullptr;
+
+bool is_license_host(const char *node) {
+    if (node == nullptr) {
+        return false;
+    }
+    return strcmp(node, "license.reeden.app") == 0 ||
+        strcmp(node, "license-cn.reeden.app") == 0;
+}
+
+int hooked_getaddrinfo(
+    const char *node,
+    const char *service,
+    const struct addrinfo *hints,
+    struct addrinfo **res) {
+    if (g_network_guard_enabled.load() && is_license_host(node)) {
+        const int hit = g_network_guard_hits.fetch_add(1) + 1;
+        if (hit <= 8 || hit % 20 == 0) {
+            LOGI(
+                "license getaddrinfo blocked #%d host=%s service=%s",
+                hit,
+                node,
+                service ? service : "");
+        }
+        if (res != nullptr) {
+            *res = nullptr;
+        }
+        return EAI_NONAME;
+    }
+    GetAddrInfoFn real = g_real_getaddrinfo;
+    if (real == nullptr) {
+        real = reinterpret_cast<GetAddrInfoFn>(dlsym(RTLD_NEXT, "getaddrinfo"));
+    }
+    return real ? real(node, service, hints, res) : EAI_FAIL;
+}
+
+struct ImportHookRequest {
+    const char *library_name;
+    const char *symbol_name;
+    void *replacement;
+    void **original;
+    void ***slot_out;
+    bool patched;
+    bool library_seen;
+};
+
+template <typename T>
+T *dynamic_ptr(ElfW(Addr) value, ElfW(Addr) base) {
+    const uintptr_t raw = static_cast<uintptr_t>(value);
+    if (raw >= static_cast<uintptr_t>(base)) {
+        return reinterpret_cast<T *>(raw);
+    }
+    return reinterpret_cast<T *>(static_cast<uintptr_t>(base) + raw);
+}
+
+bool patch_pointer_slot(void **slot, void *replacement, void **original) {
+    if (slot == nullptr || replacement == nullptr) {
+        return false;
+    }
+    if (*slot == replacement) {
+        return true;
+    }
+    if (original != nullptr && *original == nullptr) {
+        *original = *slot;
+    }
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t start = reinterpret_cast<uintptr_t>(slot) & ~(page - 1);
+    if (mprotect(reinterpret_cast<void *>(start), page, PROT_READ | PROT_WRITE) != 0) {
+        LOGE("network guard mprotect RW failed slot=%p errno=%d", slot, errno);
+        return false;
+    }
+    *slot = replacement;
+    // Keep the GOT page writable after patching. Some Android builds co-locate
+    // mutable runtime data with GOT/RELRO pages; restoring read-only here can
+    // break those builds even though this target currently uses BIND_NOW.
+    if (mprotect(reinterpret_cast<void *>(start), page, PROT_READ | PROT_WRITE) != 0) {
+        LOGW("network guard mprotect restore failed slot=%p errno=%d", slot, errno);
+    }
+    return *slot == replacement;
+}
+
+int hook_import_cb(struct dl_phdr_info *info, size_t, void *data) {
+    auto *request = static_cast<ImportHookRequest *>(data);
+    if (info->dlpi_name == nullptr) {
+        return 0;
+    }
+    const char *slash = strrchr(info->dlpi_name, '/');
+    const char *base_name = slash ? slash + 1 : info->dlpi_name;
+    if (strcmp(base_name, request->library_name) != 0) {
+        return 0;
+    }
+    request->library_seen = true;
+
+    auto *dynamic = static_cast<ElfW(Dyn) *>(nullptr);
+    for (size_t i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) &phdr = info->dlpi_phdr[i];
+        if (phdr.p_type == PT_DYNAMIC) {
+            dynamic = reinterpret_cast<ElfW(Dyn) *>(info->dlpi_addr + phdr.p_vaddr);
+            break;
+        }
+    }
+    if (dynamic == nullptr) {
+        LOGW("network guard: PT_DYNAMIC not found for %s", request->library_name);
+        return 1;
+    }
+
+    auto *symtab = static_cast<ElfW(Sym) *>(nullptr);
+    auto *strtab = static_cast<const char *>(nullptr);
+    auto *rela = static_cast<ElfW(Rela) *>(nullptr);
+    size_t rela_count = 0;
+
+    for (ElfW(Dyn) *entry = dynamic; entry->d_tag != DT_NULL; ++entry) {
+        switch (entry->d_tag) {
+            case DT_SYMTAB:
+                symtab = dynamic_ptr<ElfW(Sym)>(entry->d_un.d_ptr, info->dlpi_addr);
+                break;
+            case DT_STRTAB:
+                strtab = dynamic_ptr<const char>(entry->d_un.d_ptr, info->dlpi_addr);
+                break;
+            case DT_JMPREL:
+                rela = dynamic_ptr<ElfW(Rela)>(entry->d_un.d_ptr, info->dlpi_addr);
+                break;
+            case DT_PLTRELSZ:
+                rela_count = static_cast<size_t>(entry->d_un.d_val) / sizeof(ElfW(Rela));
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (symtab == nullptr || strtab == nullptr || rela == nullptr || rela_count == 0) {
+        LOGW(
+            "network guard: relocation data incomplete for %s symtab=%p strtab=%p rela=%p count=%zu",
+            request->library_name,
+            symtab,
+            strtab,
+            rela,
+            rela_count);
+        return 1;
+    }
+
+    for (size_t i = 0; i < rela_count; ++i) {
+        const auto type = ELF64_R_TYPE(rela[i].r_info);
+        if (type != R_AARCH64_JUMP_SLOT && type != R_AARCH64_GLOB_DAT) {
+            continue;
+        }
+        const auto symbol_index = ELF64_R_SYM(rela[i].r_info);
+        const char *name = strtab + symtab[symbol_index].st_name;
+        if (strcmp(name, request->symbol_name) != 0) {
+            continue;
+        }
+
+        auto **slot = reinterpret_cast<void **>(info->dlpi_addr + rela[i].r_offset);
+        if (patch_pointer_slot(slot, request->replacement, request->original)) {
+            if (request->slot_out != nullptr) {
+                *request->slot_out = slot;
+            }
+            request->patched = true;
+            LOGI(
+                "network guard hooked %s!%s slot=%p original=%p replacement=%p",
+                request->library_name,
+                request->symbol_name,
+                slot,
+                request->original ? *request->original : nullptr,
+                request->replacement);
+        } else {
+            LOGE(
+                "network guard failed to hook %s!%s slot=%p",
+                request->library_name,
+                request->symbol_name,
+                slot);
+        }
+        return 1;
+    }
+
+    LOGW(
+        "network guard: symbol %s not found in %s PLT relocations",
+        request->symbol_name,
+        request->library_name);
+    return 1;
+}
+
+int install_network_guard_locked() {
+    g_network_guard_attempts.fetch_add(1);
+    g_network_guard_enabled.store(true);
+    if (g_network_guard_installed.load()) {
+        return 0;
+    }
+
+    void *real = dlsym(RTLD_NEXT, "getaddrinfo");
+    if (real == nullptr) {
+        real = dlsym(RTLD_DEFAULT, "getaddrinfo");
+    }
+    if (real == nullptr) {
+        LOGE("network guard: dlsym(getaddrinfo) failed");
+        return -2;
+    }
+    g_real_getaddrinfo = reinterpret_cast<GetAddrInfoFn>(real);
+
+    void *original = reinterpret_cast<void *>(g_real_getaddrinfo);
+    ImportHookRequest request{
+        kLibFlutter,
+        "getaddrinfo",
+        reinterpret_cast<void *>(hooked_getaddrinfo),
+        &original,
+        &g_getaddrinfo_slot,
+        false,
+        false,
+    };
+    dl_iterate_phdr(hook_import_cb, &request);
+
+    if (!request.library_seen) {
+        LOGW("network guard: %s not loaded yet", kLibFlutter);
+        return -1;
+    }
+    if (!request.patched) {
+        return -3;
+    }
+
+    g_real_getaddrinfo = reinterpret_cast<GetAddrInfoFn>(original);
+    g_network_guard_installed.store(true);
+    LOGI(
+        "network guard installed mode=flutter_getaddrinfo_block slot=%p attempts=%d",
+        g_getaddrinfo_slot,
+        g_network_guard_attempts.load());
+    return 0;
+}
 
 int find_lib_cb(struct dl_phdr_info *info, size_t, void *data) {
     auto *out = static_cast<ImageInfo *>(data);
@@ -837,6 +1199,35 @@ void do_uninstall_locked() {
     LOGI("uninstalled and restored patches");
 }
 
+void set_native_log_path(JNIEnv *env, jstring value, size_t index) {
+    if (index >= kNativeLogPathCount) {
+        return;
+    }
+    const char *chars = nullptr;
+    if (value != nullptr) {
+        chars = env->GetStringUTFChars(value, nullptr);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_native_log_mu);
+        if (chars != nullptr && chars[0] != '\0') {
+            snprintf(g_native_log_paths[index], kNativeLogPathMax, "%s", chars);
+        } else {
+            g_native_log_paths[index][0] = '\0';
+        }
+    }
+
+    if (chars != nullptr) {
+        env->ReleaseStringUTFChars(value, chars);
+    }
+}
+
+void native_log_paths_snapshot(char *primary, size_t primary_size, char *mirror, size_t mirror_size) {
+    std::lock_guard<std::mutex> lock(g_native_log_mu);
+    snprintf(primary, primary_size, "%s", g_native_log_paths[0]);
+    snprintf(mirror, mirror_size, "%s", g_native_log_paths[1]);
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jint JNICALL
@@ -898,11 +1289,76 @@ Java_com_xiyunmn_reedenhook_feature_premium_NativePremiumUnlock_nativeStatus(
     return env->NewStringUTF(buf);
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeSetFileLogPaths(
+    JNIEnv *env,
+    jclass,
+    jstring private_path,
+    jstring external_path) {
+    set_native_log_path(env, private_path, 0);
+    set_native_log_path(env, external_path, 1);
+
+    char primary[kNativeLogPathMax] {};
+    char mirror[kNativeLogPathMax] {};
+    native_log_paths_snapshot(primary, sizeof(primary), mirror, sizeof(mirror));
+    LOGI(
+        "network guard file logging configured private=%s external=%s",
+        primary[0] != '\0' ? primary : "n/a",
+        mirror[0] != '\0' ? mirror : "n/a");
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeInstall(
+    JNIEnv *,
+    jclass) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    return install_network_guard_locked();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeSetEnabled(
+    JNIEnv *,
+    jclass,
+    jboolean enabled) {
+    g_network_guard_enabled.store(enabled == JNI_TRUE);
+    LOGI(
+        "network guard enabled=%d installed=%d hits=%d",
+        enabled == JNI_TRUE,
+        g_network_guard_installed.load() ? 1 : 0,
+        g_network_guard_hits.load());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeIsInstalled(
+    JNIEnv *,
+    jclass) {
+    return g_network_guard_installed.load() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeStatus(
+    JNIEnv *env,
+    jclass) {
+    char buf[320];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "mode=flutter_getaddrinfo_block installed=%d enabled=%d attempts=%d "
+        "hits=%d slot=%p real=%p",
+        g_network_guard_installed.load() ? 1 : 0,
+        g_network_guard_enabled.load() ? 1 : 0,
+        g_network_guard_attempts.load(),
+        g_network_guard_hits.load(),
+        g_getaddrinfo_slot,
+        reinterpret_cast<void *>(g_real_getaddrinfo));
+    return env->NewStringUTF(buf);
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     JNIEnv *env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
-    LOGI("JNI_OnLoad reeden_unlock v0.4.6 single-pass gate scanner");
+    LOGI("JNI_OnLoad reeden_unlock v0.5.1 network guard available");
     return JNI_VERSION_1_6;
 }

@@ -1,5 +1,6 @@
 package com.xiyunmn.reedenhook.core
 
+import android.content.Context
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
@@ -26,14 +27,30 @@ object HookApi {
         }
     }
 
+    fun configureHostFileLogging(context: Context, reason: String): HostFileLogger.Paths {
+        val paths = HostFileLogger.configure(context, reason)
+        val message = "File logging active reason=$reason private=${paths.privatePath} " +
+            "external=${paths.externalPath ?: "n/a"}"
+        if (paths.changed) {
+            i(message)
+        } else {
+            d(message)
+        }
+        return paths
+    }
+
+    fun currentFileLogPaths(): HostFileLogger.Paths = HostFileLogger.currentPaths()
+
     fun i(message: String, tag: String = TAG) {
         Log.i(tag, message)
         module?.log(Log.INFO, tag, message)
+        HostFileLogger.log(Log.INFO, tag, message)
     }
 
     fun w(message: String, tag: String = TAG) {
         Log.w(tag, message)
         module?.log(Log.WARN, tag, message)
+        HostFileLogger.log(Log.WARN, tag, message)
     }
 
     fun e(message: String, tag: String = TAG, throwable: Throwable? = null) {
@@ -44,11 +61,13 @@ object HookApi {
             Log.e(tag, message, throwable)
             module?.log(Log.ERROR, tag, message, throwable)
         }
+        HostFileLogger.log(Log.ERROR, tag, message, throwable)
     }
 
     fun d(message: String, tag: String = TAG) {
         Log.d(tag, message)
         module?.log(Log.DEBUG, tag, message)
+        HostFileLogger.log(Log.DEBUG, tag, message)
     }
 
     fun findClassOrNull(name: String, classLoader: ClassLoader): Class<*>? {

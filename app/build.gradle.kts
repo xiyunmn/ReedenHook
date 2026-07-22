@@ -11,8 +11,8 @@ android {
         applicationId = "com.xiyunmn.reedenhook"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "0.5.0"
+        versionCode = 12
+        versionName = "0.5.1"
 
         buildConfigField("String", "HOST_PACKAGE", "\"app.reeden\"")
         buildConfigField("String", "HOST_VERSION_NAME", "\"1.37.1\"")

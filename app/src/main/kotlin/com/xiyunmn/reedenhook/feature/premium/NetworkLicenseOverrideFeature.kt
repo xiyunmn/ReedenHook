@@ -71,6 +71,7 @@ object NetworkLicenseOverrideFeature {
     private val localRepairChecks = AtomicInteger(0)
     private val localRepairWrites = AtomicInteger(0)
     private val localRepairSkips = AtomicInteger(0)
+    private val networkGuardStarted = AtomicBoolean(false)
     private var localLastRepairAt = 0L
     private var localBackupDone = false
     private var localObserver: FileObserver? = null
@@ -91,6 +92,7 @@ object NetworkLicenseOverrideFeature {
                 "mode=network_response_override hosts=${targetHosts.joinToString(",")}",
             TAG,
         )
+        startNativeNetworkGuard("feature.install")
         installLocalLicenseRepairHooks(module)
         installUrlHooks(module)
         installConnectionHooks(module, classLoader)
@@ -124,6 +126,8 @@ object NetworkLicenseOverrideFeature {
         runCatching { localObserver?.stopWatching() }
         localObserver = null
         localGuardianStarted.set(false)
+        networkGuardStarted.set(false)
+        NativeNetworkGuard.setEnabled(false)
         synchronized(localRepairLock) {
             localLastRepairAt = 0L
             localBackupDone = false
@@ -163,6 +167,9 @@ object NetworkLicenseOverrideFeature {
             return
         }
 
+        val logPaths = HookApi.configureHostFileLogging(appContext, reason)
+        NativeNetworkGuard.configureFileLogging(logPaths)
+        startNativeNetworkGuard(reason)
         repairLocalLicense(appContext, "$reason.immediate")
         if (!localGuardianStarted.compareAndSet(false, true)) {
             return
@@ -174,10 +181,16 @@ object NetworkLicenseOverrideFeature {
                 val earlyDelays = longArrayOf(250L, 500L, 1_000L, 2_000L, 4_000L, 8_000L, 15_000L)
                 earlyDelays.forEachIndexed { index, delayMs ->
                     runCatching { Thread.sleep(delayMs) }
+                    if (!NativeNetworkGuard.isInstalled()) {
+                        startNativeNetworkGuard("guardian.early.$index.${delayMs}ms")
+                    }
                     repairLocalLicense(appContext, "guardian.early.$index.${delayMs}ms")
                 }
                 while (localGuardianStarted.get()) {
                     runCatching { Thread.sleep(LOCAL_POLL_INTERVAL_MS) }
+                    if (!NativeNetworkGuard.isInstalled()) {
+                        startNativeNetworkGuard("guardian.poll")
+                    }
                     repairLocalLicense(appContext, "guardian.poll")
                 }
             },
@@ -187,6 +200,39 @@ object NetworkLicenseOverrideFeature {
             start()
         }
         HookApi.i("local license cache guard started path=${hiveFileFor(appContext).absolutePath}", TAG)
+    }
+
+    private fun startNativeNetworkGuard(reason: String) {
+        if (NativeNetworkGuard.isInstalled()) {
+            return
+        }
+        if (!networkGuardStarted.compareAndSet(false, true)) {
+            val code = NativeNetworkGuard.install("$reason.retry")
+            if (code != -1 && code != -3) {
+                networkGuardStarted.set(NativeNetworkGuard.isInstalled())
+            }
+            return
+        }
+        Thread(
+            {
+                val attempts = longArrayOf(0L, 120L, 300L, 700L, 1_500L, 3_000L, 6_000L, 10_000L)
+                attempts.forEachIndexed { index, delayMs ->
+                    if (delayMs > 0) {
+                        runCatching { Thread.sleep(delayMs) }
+                    }
+                    val code = NativeNetworkGuard.install("$reason.native.$index")
+                    if (code == 0 || NativeNetworkGuard.isInstalled()) {
+                        return@Thread
+                    }
+                }
+                networkGuardStarted.set(false)
+                HookApi.w("NativeNetworkGuard not installed after retries status=${NativeNetworkGuard.status()}", TAG)
+            },
+            "ReedenHook-NetworkGuard",
+        ).apply {
+            isDaemon = true
+            start()
+        }
     }
 
     private fun installHiveObserver(context: Context) {

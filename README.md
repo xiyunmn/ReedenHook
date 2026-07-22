@@ -70,6 +70,9 @@ Architecture check runs on `:app:preBuild` (`verifyArchitecture`).
 3. Scope: **Reeden** only (`app.reeden`, staticScope).
 4. Force-stop / reopen Reeden.
 5. Check logcat: `ReedenHook`.
+6. Check host file logs when logcat is noisy:
+   - Private: `/data/user/0/app.reeden/files/reedenhook/logs/reedenhook.log`
+   - External mirror: `/sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log`
 
 ## Status
 
@@ -144,12 +147,18 @@ LSPosed: enable module -> scope **Reeden only** -> force-stop Reeden.
 adb logcat -s ReedenHook ReedenHook.Native
 ```
 
+File log mirror:
+
+```powershell
+adb shell cat /sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log
+```
+
 Expect: 
 ```
-I/ReedenHook.Native: feature gates patched tbz=73 tbnz=24 supplemental=7 failed=0
-I/ReedenHook.Native: install done mode=single_pass_gate_scan total_patches=99 license_rc=0 gates=97
-I/ReedenHook: Native premium unlock installed (packageReady#0) code=0
-                status=mode=single_pass_gate_scan installed=1 patches=99
+I/ReedenHook.Network: NetworkLicenseOverrideFeature.install ... mode=network_response_override
+I/ReedenHook.Native: network guard hooked libflutter.so!getaddrinfo ...
+I/ReedenHook.Native: license getaddrinfo blocked #1 host=license.reeden.app ...
+I/ReedenHook.Network: local license cache intact ...
 ```
 
 ## Cross-Version Compatibility

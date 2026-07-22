@@ -1,8 +1,8 @@
 # ReedenHook
 
-**Version-Resilient** LSPosed module for **Reeden** (`app.reeden`) - Local Pro unlock via runtime pattern scanner.
+**Version-resilient** LSPosed module for **Reeden** (`app.reeden`) - local Pro unlock via a hybrid license publisher and runtime gate scanner.
 
-**v0.3.0**: Cross-version compatible - auto-adapts to new Reeden versions without manual analysis.
+**v0.4.1**: slot-anchored scanning with full structural coverage, verified on Reeden 1.37.1, and clean hot-reload rollback.
 
 Stack: **libxposed API 102** (modern LSPosed)
 
@@ -11,13 +11,16 @@ Stack: **libxposed API 102** (modern LSPosed)
 | Field | Value |
 |---|---|
 | Package | `app.reeden` |
-| Sample version | 1.36.1 (684) |
-| Engine | Flutter / Dart **3.10.7** |
+| Verified version | 1.37.1 (694) |
+| Engine | Flutter / Dart AOT (`3.10.7` baseline) |
 | Main logic | `libapp.so` (AOT) |
 
-## Premium gate (reverse summary)
+## Premium Gate Baseline
 
-| Item | Value |
+Reverse-engineering baseline from Reeden 1.36.1; v0.4.1 discovers current RVAs
+and field-table slots at runtime.
+
+| Item | 1.36.1 baseline |
 |---|---|
 | Pro holder | `CZc` / PurchasesUtil |
 | Singleton | `CZc.Fwn` @ THR slot `0x5268` |
@@ -42,7 +45,7 @@ app/src/main/
     entry/ReedenHookModule.kt     # XposedModule API 102
     core/HookApi.kt               # only hook installation site
     host/HostPackages.kt          # app.reeden
-    host/HostAot.kt               # AOT offsets for 1.36.1
+    host/HostAot.kt               # AOT reference constants and lib names
     feature/premium/              # unlock feature (probe + plan)
   resources/META-INF/xposed/
     java_init.list
@@ -71,53 +74,55 @@ Architecture check runs on `:app:preBuild` (`verifyArchitecture`).
 ## Status
 
 - [x] Modern API 102 scaffold (libxposed)
-- [x] **v0.3.0 Runtime Scanner**: Cross-version pattern matching
-  - Scans `libapp.so` for stable pattern: `ldur wN,[x?,#0x27]` + `tbz/tbnz wN,#4`
-  - **97 gates patched** (72 TBZ + 25 TBNZ) in <10ms on device
-- [x] **Version Resilience**: Auto-adapts to new Reeden versions
-  - Pattern stability: field_27 offset unchanged across Dart AOT versions
-  - No manual reverse engineering needed for minor updates
+- [x] **v0.4.1 Hybrid Scanner**: license publication plus slot-anchored gate matching
+  - Discovers the `CZc.Fwn` slot from the dominant `field_27` gate cluster
+  - Matches 90 adjacent gates plus 7 delayed/derived gates without hardcoded RVAs
+  - **97 gates patched** (73 TBZ + 24 TBNZ) on Reeden 1.37.1
+- [x] **Version resilience**: instruction and control-flow signatures adapt to AOT layout churn
+  - Ambiguous or missing signatures are skipped instead of patched speculatively
+  - New host versions still require log/feature verification before being declared supported
 - [x] **Functional unlock**: All premium features work (export, search, multi-window, themes)
-- [x] **True device test**: OnePlus PJZ110 / Android 16 / Reeden 1.36.1 verified
-- [⚠️] **UI state**: Functions work, UI may show "Upgrade" on first launch (restart app)
+- [x] **True device test**: OnePlus PJZ110 / Android 16 / Reeden 1.37.1 verified
+- [x] **Hot reload cleanup**: pending retries are cancelled and every installed native patch is restored
 
 ## How unlock works
 
-### v0.3.0 - Runtime Scanner (Cross-Version Compatible)
+### v0.4.1 - Hybrid Runtime Scanner
 
 Native library `libreeden_unlock.so` (arm64 only) performs smart pattern matching:
 
 1. **Locate target**: Find `libapp.so` base address and size via `dl_iterate_phdr`
-2. **Pattern matching**: Scan for stable gate pattern (version-independent):
-   - Pattern: `ldur wN,[x?,#0x27]` followed by `tbz/tbnz wN,#4` (within 20 instructions)
-   - Currently uses known offsets from v0.1.1 (safe fallback to avoid crashes)
-   - **Future**: Full ELF .text section scanner with register tracking
-3. **Binary patching**: Patch all discovered gates:
+2. **License publication**: Find the unique `Kwn` fallback sequence and force its published value to Dart `true`
+3. **Gate discovery**:
+   - Find adjacent `ldur field_27; decompress; tbz/tbnz #4` gates
+   - Group them by the preceding Dart field-table slot and select the dominant `CZc.Fwn` cluster
+   - Match seven strict supplemental shapes where the value crosses short control flow or a helper call
+4. **Binary patching**: Patch all verified gates:
    - **TBZ sites**: `tbz wN, #4, <free>` → `b <premium>` (unconditional jump to premium path)
    - **TBNZ sites**: `tbnz wN, #4, <premium>` → `NOP` (fall through to premium path)
-4. **Verification**: Each patch validates instruction encoding before rewrite
-5. **Cleanup**: Restore original code on hot reload / module unload
+5. **Verification**: Validate instruction encodings, slot ownership, branch targets, and patch readback
+6. **Cleanup**: Cancel stale retries and restore original code on hot reload
 
 **Why no inline hooks?** Dart AOT uses `x15` as stack pointer (not standard `sp`), making trampoline-based hooks unstable. Direct instruction rewrite is safer.
 
-**Why pattern-based?** The gate pattern (`ldur #0x27` + `tbz/tbnz #4`) is architecturally stable - it's how Dart AOT compiles boolean field checks. This survives Dart/Flutter version upgrades.
+**Why slot-anchored?** `field_27` and bit 4 are generic Dart boolean shapes. Patching all 357 raw matches corrupts unrelated app logic; the field-table slot and supplemental control-flow signatures identify the `CZc.Fwn` family safely.
 
-**Retry logic**: Install attempts at multiple points (`packageReady`, `Application.attach`, `Application.onCreate`) until `libapp.so` is mapped (typically succeeds on first try at ~100ms).
+**Retry logic**: Install attempts at multiple points (`packageReady`, `Application.attach`, `Application.onCreate`) until `libapp.so` is mapped. Retries carry a lifecycle generation, so callbacks queued before hot reload cannot reinstall restored patches.
 
-### Known Limitation (Minor)
+### Known limitations
 
-✅ **Functions work**: All premium features (export, search, themes, multi-window) unlocked  
-⚠️ **UI state**: On first launch, UI may show "Upgrade" banner (restart app to sync)
-
-**Root cause**: Direct binary patches skip `CZc.Lo` (ChangeNotifier at slot `0x5260`). App restart triggers natural `Kwn` refresh which synchronizes UI state.
+- Native patching is arm64-only.
+- Gate patches provide the cold-start functional fallback. UI license state is synchronized when the app runs the patched `Kwn` publication path.
+- A new host build is accepted only when its runtime signatures remain unambiguous; failure is reported in logcat without broad boolean patching.
 
 ### Version History
 
 | Version | Strategy | Resilience | Status |
 |---|---|---|---|
 | v0.1.1 | Hardcoded 99 offsets | ❌ Version-locked | Deprecated |
-| v0.2.0 | Hive forge (abandoned) | ✅✅✅ | ⚠️ Dart Hive has no Java layer |
-| **v0.3.0** | **Runtime scanner** | **✅✅ Auto-adapts** | **✅ Current** |
+| v0.2.0 | Hive forge | ❌ No Java interception layer | Removed |
+| v0.3.0 | Broad runtime scanner | ⚠️ Generic bool false positives | Deprecated |
+| **v0.4.1** | **License + slot/structure scanner** | **✅ Fail-closed signatures** | **Current** |
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 
@@ -141,34 +146,35 @@ adb logcat -s ReedenHook ReedenHook.Native
 
 Expect: 
 ```
-I/ReedenHook.Native: install done ok=99 fail=0 (tbz=72 tbnz=25 kwn=2)
-I/ReedenHook: Native premium unlock installed (packageReady#0) code=0 
-                status=mode=patch installed=1 enabled=1 base=0x7XXXXXXX patches=99
+I/ReedenHook.Native: feature gates patched tbz=73 tbnz=24 supplemental=7 failed=0
+I/ReedenHook.Native: install done mode=license_plus_gate_scan total_patches=99 license_rc=0 gates=97
+I/ReedenHook: Native premium unlock installed (packageReady#0) code=0
+                status=mode=license_plus_gate_scan installed=1 patches=99
 ```
 
 ## Cross-Version Compatibility
 
 ### Adaptation Strategy
 
-**Pattern Stability**: The gate pattern is architecturally stable across Dart AOT versions:
+**Pattern stability**: The primary gate pattern is stable across Dart AOT versions:
 - `ldur wN, [xM, #0x27]` - loads `CZc.Fwn.field_27` (Pro boolean flag)
 - `tbz wN, #4, label` or `tbnz wN, #4, label` - tests bit 4 (Dart boolean encoding)
 
-This pattern doesn't change unless Reeden:
+The scanner additionally requires the same field-table slot cluster and validates derived control flow. Compatibility can change if Reeden:
 1. Renames the Pro flag field (unlikely - breaks compatibility)
 2. Switches premium system architecture (major refactor)
 3. Changes Dart AOT codegen fundamentally (requires Flutter upgrade)
 
-**Tested Versions**: 1.36.1 build 684 (current)
+**Tested Versions**: 1.36.1 build 684, 1.37.1 build 694 (current device, verified 2026-07-22)
 
-**Expected Compatibility**: Minor versions (1.36.x, 1.37.x) should work without updates. Major versions (2.x) may require pattern verification.
+**Expected compatibility**: Minor versions may work without source changes, but must be verified from runtime counts and feature tests. Major versions may require new structural signatures.
 
 ### Future Roadmap
 
 | Feature | Priority | Complexity | Benefit |
 |---|---|---|---|
-| Full ELF .text scanner | High | Medium | Discovers new gates automatically |
-| Multi-version offset cache | Medium | Low | Instant adaptation to known versions |
+| Host-signature regression corpus | High | Medium | Verifies scanner coverage before release |
+| Multi-version structural fixtures | Medium | Medium | Detects AOT codegen changes early |
 | Network intercept (block server sync) | Low | High | Prevents remote license checks |
 
 See [local_docs/后续计划.md](local_docs/后续计划.md) for detailed roadmap.

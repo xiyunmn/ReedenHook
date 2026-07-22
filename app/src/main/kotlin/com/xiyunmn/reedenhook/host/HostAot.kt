@@ -1,17 +1,21 @@
 package com.xiyunmn.reedenhook.host
 
 /**
- * AOT / reverse-engineering constants for Reeden 1.36.1 (Dart 3.10.7).
+ * Reference AOT / reverse-engineering constants from the Reeden 1.36.1 corpus
+ * (Dart 3.10.7).
  *
  * Offsets are RVAs inside `lib/arm64-v8a/libapp.so` (image base 0).
  * Confirmed via blutter + IDA session `reeden01`.
  *
- * These are for documentation and native binary patching. Pure Java hooks
- * cannot call into Dart AOT by themselves.
+ * The active native unlock discovers current host RVAs and field-table slots at
+ * runtime; these constants document the original analysis baseline. Pure Java
+ * hooks cannot call into Dart AOT by themselves.
  */
 object HostAot {
     const val LIB_APP: String = "libapp.so"
     const val LIB_FLUTTER: String = "libflutter.so"
+
+    /** Dart SDK version from the 1.36.1 reference corpus. */
     const val DART_VERSION: String = "3.10.7"
     const val SNAPSHOT_HASH: String = "1ce86630892e2dca9a8543fdb8ed8e22"
 
@@ -58,7 +62,7 @@ object HostAot {
     const val LOC_JBN_DESERIALIZE: Long = 0xFC034CL
     const val LOC_JBN_SERIALIZE: Long = 0xFC0310L
 
-    /** Kwn force-true binary patch sites (see reeden_unlock.cpp). */
+    /** Kwn force-true binary patch sites from the 1.36.1 reference corpus. */
     const val KWN_BNE_FORCE_TRUE: Long = 0x224883CL
     const val KWN_ADD_FALSE_TO_TRUE: Long = 0x2248840L
 
@@ -67,6 +71,6 @@ object HostAot {
 
     /** Synthetic license payload for local unlock research (GZc JSON keys). */
     const val FORGE_EMAIL: String = "reedenhook@local"
-    const val FORGE_LICENSE_KEY: String = "RH-LOCAL-UNLOCK-1.36.1"
+    const val FORGE_LICENSE_KEY: String = "RH-LOCAL-UNLOCK-1.37.1"
     const val FORGE_ORDER_ID: String = "reedenhook-local"
 }

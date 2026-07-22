@@ -81,6 +81,7 @@ struct GateSite {
     GateKind kind;
     uintptr_t rva;
     uint32_t slot;  // THR field-table byte offset of the anchoring static field.
+    bool supplemental;
 };
 
 std::mutex g_mu;
@@ -89,6 +90,7 @@ std::atomic<bool> g_installed{false};
 std::atomic<int> g_patch_count{0};
 std::atomic<int> g_gate_tbz{0};
 std::atomic<int> g_gate_tbnz{0};
+std::atomic<int> g_gate_supplemental{0};
 std::atomic<int> g_license_patches{0};
 void *g_libapp_base = nullptr;
 size_t g_libapp_size = 0;
@@ -216,6 +218,58 @@ bool is_bl(uint32_t insn) {
     return ((insn >> 26) & 0x3Fu) == 0x25u;
 }
 
+bool is_ldur_x_from_fp(uint32_t insn, uint32_t value_reg) {
+    return ((insn >> 21) & 0x7FFu) == 0x7C2u &&
+        ((insn >> 5) & 0x1Fu) == 29u &&
+        (insn & 0x1Fu) == value_reg;
+}
+
+bool is_cmp_w_regs(uint32_t insn, uint32_t left_reg, uint32_t right_reg) {
+    return ((insn >> 21) & 0x7FFu) == 0x358u &&
+        ((insn >> 16) & 0x1Fu) == right_reg &&
+        ((insn >> 10) & 0x3Fu) == 0 &&
+        ((insn >> 5) & 0x1Fu) == left_reg &&
+        (insn & 0x1Fu) == 31u;
+}
+
+uintptr_t pc_relative_target(uint32_t *addr, uint32_t encoded, uint32_t mask) {
+    int64_t immediate = static_cast<int64_t>(encoded & mask);
+    const int64_t sign_bit = static_cast<int64_t>(mask + 1u) >> 1;
+    if ((immediate & sign_bit) != 0) {
+        immediate -= static_cast<int64_t>(mask) + 1;
+    }
+    return reinterpret_cast<uintptr_t>(addr) + immediate * sizeof(uint32_t);
+}
+
+bool is_b_cond_to(
+    uint32_t *addr, uint32_t insn, uint32_t condition, uint32_t *target) {
+    if ((insn & 0xFF000010u) != 0x54000000u ||
+        (insn & 0xFu) != condition) {
+        return false;
+    }
+    const uint32_t imm19 = (insn >> 5) & 0x7FFFFu;
+    return pc_relative_target(addr, imm19, 0x7FFFFu) ==
+        reinterpret_cast<uintptr_t>(target);
+}
+
+bool is_b_to(uint32_t *addr, uint32_t insn, uint32_t **target) {
+    if (((insn >> 26) & 0x3Fu) != 0x05u) {
+        return false;
+    }
+    *target = reinterpret_cast<uint32_t *>(
+        pc_relative_target(addr, insn & 0x03FFFFFFu, 0x03FFFFFFu));
+    return true;
+}
+
+bool is_bl_to(uint32_t *addr, uint32_t insn, uint32_t **target) {
+    if (!is_bl(insn)) {
+        return false;
+    }
+    *target = reinterpret_cast<uint32_t *>(
+        pc_relative_target(addr, insn & 0x03FFFFFFu, 0x03FFFFFFu));
+    return true;
+}
+
 bool is_ldr_x0_thr_field_table(uint32_t insn) {
     // ldr x0, [x26, #0x78]
     return insn == 0xF9403F40u;
@@ -257,6 +311,18 @@ bool is_tbnz_bit4(uint32_t insn, uint32_t reg) {
     return ((insn >> 24) & 0x7Fu) == 0x37u &&
         tbz_tbnz_bit_index(insn) == 4u &&
         (insn & 0x1Fu) == reg;
+}
+
+bool decode_gate_kind(uint32_t insn, uint32_t reg, GateKind *kind) {
+    if (is_tbz_bit4(insn, reg)) {
+        *kind = GateKind::kTbz;
+        return true;
+    }
+    if (is_tbnz_bit4(insn, reg)) {
+        *kind = GateKind::kTbnz;
+        return true;
+    }
+    return false;
 }
 
 uint32_t replace_add_imm12(uint32_t insn, uint32_t imm12) {
@@ -341,9 +407,10 @@ std::vector<LicensePublishSite> scan_license_publish_sites(const ImageInfo &imag
 // candidate with the field-table SLOT loaded in its InitLateStaticField prologue
 // (scanning back a bounded window), then patch ONLY the dominant slot's cluster.
 //
-// Offline against 1.36.1: dominant slot = 0x5268, 88 gates, ZERO false positives
-// (all 88 are curated Fwn gates), 88/97 coverage. The dominant slot is discovered
-// at runtime, so no RVA/slot is hardcoded and it survives AOT churn across versions.
+// Offline against 1.36.1: dominant slot = 0x5268, 90 adjacent gates, ZERO false
+// positives. Seven more gates use delayed or derived control flow; they are picked
+// up by the supplemental structural scanner below. The slot is still discovered
+// at runtime, so neither scanner depends on a hardcoded RVA or field-table slot.
 
 constexpr size_t kSlotBackWindow = 20;  // instructions to scan back for prologue
 
@@ -387,11 +454,7 @@ std::vector<GateSite> scan_feature_gates(const ImageInfo &image) {
             }
 
             GateKind kind;
-            if (is_tbz_bit4(instructions[2], value_reg)) {
-                kind = GateKind::kTbz;
-            } else if (is_tbnz_bit4(instructions[2], value_reg)) {
-                kind = GateKind::kTbnz;
-            } else {
+            if (!decode_gate_kind(instructions[2], value_reg, &kind)) {
                 continue;
             }
 
@@ -399,7 +462,8 @@ std::vector<GateSite> scan_feature_gates(const ImageInfo &image) {
             const uintptr_t rva =
                 reinterpret_cast<uintptr_t>(&instructions[2]) -
                 reinterpret_cast<uintptr_t>(image.base);
-            sites.push_back(GateSite{&instructions[2], kind, rva, slot});
+            sites.push_back(
+                GateSite{&instructions[2], kind, rva, slot, false});
         }
     }
     return sites;
@@ -435,6 +499,132 @@ uint32_t dominant_gate_slot(const std::vector<GateSite> &gates) {
         }
     }
     return best_slot;
+}
+
+bool segment_contains(
+    const ExecutableSegment &segment, const uint32_t *addr, size_t count) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(segment.start);
+    const uintptr_t end = start + segment.size;
+    const uintptr_t at = reinterpret_cast<uintptr_t>(addr);
+    return at >= start && at <= end && count <= (end - at) / sizeof(uint32_t);
+}
+
+void append_supplemental_gate(
+    std::vector<GateSite> *sites,
+    uint32_t *branch,
+    GateKind kind,
+    uint32_t slot,
+    const ImageInfo &image) {
+    for (const GateSite &site : *sites) {
+        if (site.branch == branch) {
+            return;
+        }
+    }
+    const uintptr_t rva =
+        reinterpret_cast<uintptr_t>(branch) -
+        reinterpret_cast<uintptr_t>(image.base);
+    sites->push_back(GateSite{branch, kind, rva, slot, true});
+}
+
+// Some AOT gates are not the adjacent three-instruction micro-sequence:
+//
+//  * switch-like code carries the Fwn boolean across a short control-flow block;
+//  * helper calls combine Fwn with another value and branch on the result;
+//  * one helper receives the Fwn boolean as an argument and tests it at entry.
+//
+// These structural signatures are intentionally strict. Each begins at an
+// `ldur field_27 + decompress` pair anchored to the already-discovered dominant
+// slot, and all control-flow targets/registers are verified before a gate is
+// accepted. On 1.36.1 this contributes seven gates (97 total) with no RVAs.
+std::vector<GateSite> scan_supplemental_feature_gates(
+    const ImageInfo &image, uint32_t dominant_slot) {
+    std::vector<GateSite> sites;
+
+    for (const ExecutableSegment &segment : image.executable_segments) {
+        for (size_t offset = 0; offset + 8 <= segment.size;
+             offset += sizeof(uint32_t)) {
+            auto *instructions =
+                reinterpret_cast<uint32_t *>(segment.start + offset);
+            const uint32_t value_reg = instructions[0] & 0x1Fu;
+            if (!is_ldur_w_imm(instructions[0], kField27Imm9) ||
+                !is_decompress_with_x28(instructions[1], value_reg) ||
+                find_anchor_slot(segment, instructions) != dominant_slot) {
+                continue;
+            }
+
+            GateKind kind;
+
+            // Delayed test: two conditional arms preserve the Fwn register and
+            // converge at the bit test; the other arms bypass it.
+            if (segment_contains(segment, instructions, 18)) {
+                uint32_t *first_bypass = nullptr;
+                uint32_t *second_bypass = nullptr;
+                if (is_b_cond_to(
+                        &instructions[6], instructions[6], 1u,
+                        &instructions[10]) &&
+                    is_b_to(
+                        &instructions[9], instructions[9], &first_bypass) &&
+                    is_b_cond_to(
+                        &instructions[13], instructions[13], 1u,
+                        &instructions[17]) &&
+                    is_b_to(
+                        &instructions[16], instructions[16], &second_bypass) &&
+                    first_bypass == second_bypass &&
+                    first_bypass > &instructions[17] &&
+                    decode_gate_kind(instructions[17], value_reg, &kind)) {
+                    append_supplemental_gate(
+                        &sites, &instructions[17], kind, dominant_slot, image);
+                }
+            }
+
+            // Fwn is passed to a local boolean helper together with two values;
+            // the following branch consumes that helper's result in w0.
+            if (segment_contains(segment, instructions, 6) &&
+                is_ldur_x_from_fp(instructions[2], 1u) &&
+                is_ldur_x_from_fp(instructions[3], 2u) &&
+                is_bl(instructions[4]) &&
+                decode_gate_kind(instructions[5], 0u, &kind)) {
+                append_supplemental_gate(
+                    &sites, &instructions[5], kind, dominant_slot, image);
+            }
+
+            // A true Fwn value skips a secondary helper; the false path tests
+            // its result. Both paths converge immediately after this gate.
+            if (segment_contains(segment, instructions, 18)) {
+                const uint32_t true_reg = instructions[2] & 0x1Fu;
+                if (is_add_x_reg_x22_imm(
+                        instructions[2], true_reg, kDartTrueOffset) &&
+                    is_cmp_w_regs(instructions[3], value_reg, true_reg) &&
+                    is_b_cond_to(
+                        &instructions[4], instructions[4], 0u,
+                        &instructions[17]) &&
+                    is_bl(instructions[15]) &&
+                    decode_gate_kind(instructions[16], 0u, &kind)) {
+                    append_supplemental_gate(
+                        &sites, &instructions[16], kind, dominant_slot, image);
+                }
+            }
+
+            // The Fwn value is the x2 argument to a nearby leaf helper. Patch
+            // the helper's x2 test, not the adjacent x5 test from the old
+            // hardcoded table.
+            if (segment_contains(segment, instructions, 7) &&
+                is_ldur_x_from_fp(instructions[2], 1u) &&
+                is_ldur_x_from_fp(instructions[3], 3u) &&
+                is_ldur_x_from_fp(instructions[4], 5u) &&
+                is_ldur_x_from_fp(instructions[5], 6u)) {
+                uint32_t *callee = nullptr;
+                if (is_bl_to(&instructions[6], instructions[6], &callee) &&
+                    segment_contains(segment, callee, 2) &&
+                    decode_gate_kind(callee[0], 5u, &kind) &&
+                    decode_gate_kind(callee[1], value_reg, &kind)) {
+                    append_supplemental_gate(
+                        &sites, &callee[1], kind, dominant_slot, image);
+                }
+            }
+        }
+    }
+    return sites;
 }
 
 int apply_license_publish_patches(const LicensePublishSite &site) {
@@ -478,6 +668,7 @@ int apply_gate_patches(
     const std::vector<GateSite> &gates, uint32_t dominant_slot) {
     int tbz_ok = 0;
     int tbnz_ok = 0;
+    int supplemental_ok = 0;
     int fail = 0;
     int skipped = 0;
 
@@ -494,12 +685,18 @@ int apply_gate_patches(
             }
             if (patch_instruction(gate.branch, patched)) {
                 ++tbz_ok;
+                if (gate.supplemental) {
+                    ++supplemental_ok;
+                }
             } else {
                 ++fail;
             }
         } else {
             if (patch_instruction(gate.branch, kNop)) {
                 ++tbnz_ok;
+                if (gate.supplemental) {
+                    ++supplemental_ok;
+                }
             } else {
                 ++fail;
             }
@@ -508,11 +705,13 @@ int apply_gate_patches(
 
     g_gate_tbz.store(tbz_ok);
     g_gate_tbnz.store(tbnz_ok);
+    g_gate_supplemental.store(supplemental_ok);
     LOGI(
-        "feature gates patched tbz=%d tbnz=%d failed=%d skipped=%d "
+        "feature gates patched tbz=%d tbnz=%d supplemental=%d failed=%d skipped=%d "
         "candidates=%zu dominant_slot=0x%x",
         tbz_ok,
         tbnz_ok,
+        supplemental_ok,
         fail,
         skipped,
         gates.size(),
@@ -564,7 +763,7 @@ int do_install_locked() {
     }
 
     // --- Phase 2: feature-gate pattern scan (functional unlock) ---
-    const std::vector<GateSite> gates = scan_feature_gates(image);
+    std::vector<GateSite> gates = scan_feature_gates(image);
     const uint32_t dominant_slot = dominant_gate_slot(gates);
     if (gates.empty() || dominant_slot == kNoSlot) {
         LOGE(
@@ -579,6 +778,14 @@ int do_install_locked() {
         g_installed.store(true);
         return 3;
     }
+
+    const std::vector<GateSite> supplemental =
+        scan_supplemental_feature_gates(image, dominant_slot);
+    gates.insert(gates.end(), supplemental.begin(), supplemental.end());
+    LOGI(
+        "feature gate scan direct_candidates=%zu supplemental=%zu",
+        gates.size() - supplemental.size(),
+        supplemental.size());
 
     const int gate_ok = apply_gate_patches(gates, dominant_slot);
     if (gate_ok == 0 && g_patches.empty()) {
@@ -618,6 +825,7 @@ void do_uninstall_locked() {
     g_patch_count.store(0);
     g_gate_tbz.store(0);
     g_gate_tbnz.store(0);
+    g_gate_supplemental.store(0);
     g_license_patches.store(0);
     g_license_publish_rva = 0;
     g_installed.store(false);
@@ -669,7 +877,8 @@ Java_com_xiyunmn_reedenhook_feature_premium_NativePremiumUnlock_nativeStatus(
         buf,
         sizeof(buf),
         "mode=%s installed=%d enabled=%d base=%p size=0x%zx "
-        "license_site=0x%zx license_patches=%d gates_tbz=%d gates_tbnz=%d patches=%d",
+        "license_site=0x%zx license_patches=%d gates_tbz=%d gates_tbnz=%d "
+        "gates_supplemental=%d patches=%d",
         kMode,
         g_installed.load() ? 1 : 0,
         g_enabled.load() ? 1 : 0,
@@ -679,6 +888,7 @@ Java_com_xiyunmn_reedenhook_feature_premium_NativePremiumUnlock_nativeStatus(
         g_license_patches.load(),
         g_gate_tbz.load(),
         g_gate_tbnz.load(),
+        g_gate_supplemental.load(),
         g_patch_count.load());
     return env->NewStringUTF(buf);
 }

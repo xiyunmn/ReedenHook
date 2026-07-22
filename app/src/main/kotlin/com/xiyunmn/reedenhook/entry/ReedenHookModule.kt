@@ -63,7 +63,7 @@ class ReedenHookModule : XposedModule() {
 
         HookApi.i(
             "Target ready: package=${param.packageName}, process=$processName, " +
-                "classLoader=${param.classLoader}, dart=${HostAot.DART_VERSION}",
+                "classLoader=${param.classLoader}, dartBaseline=${HostAot.DART_VERSION}",
         )
         PremiumUnlockFeature.install(this, param.classLoader, processName)
     }

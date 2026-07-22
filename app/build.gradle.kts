@@ -15,8 +15,8 @@ android {
         versionName = "0.4.1"
 
         buildConfigField("String", "HOST_PACKAGE", "\"app.reeden\"")
-        buildConfigField("String", "HOST_VERSION_NAME", "\"1.36.1\"")
-        buildConfigField("int", "HOST_VERSION_CODE", "684")
+        buildConfigField("String", "HOST_VERSION_NAME", "\"1.37.1\"")
+        buildConfigField("int", "HOST_VERSION_CODE", "694")
 
         ndk {
             abiFilters += listOf("arm64-v8a")

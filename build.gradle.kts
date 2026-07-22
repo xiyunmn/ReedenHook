@@ -4,7 +4,7 @@ plugins {
 
 tasks.register("verifyArchitecture") {
     group = "verification"
-    description = "Checks ReedenHook libxposed API 102 metadata and bans classic Xposed APIs."
+    description = "Checks libxposed API 102 metadata and bans obsolete hook implementations."
 
     doLast {
         fun sourceFiles(root: java.io.File): Sequence<java.io.File> {
@@ -12,7 +12,10 @@ tasks.register("verifyArchitecture") {
                 return emptySequence()
             }
             return root.walkTopDown().filter { file ->
-                file.isFile && file.extension in setOf("java", "kt", "kts", "xml", "list", "prop")
+                file.isFile && file.extension.lowercase() in setOf(
+                    "java", "kt", "kts", "xml", "list", "prop",
+                    "c", "cc", "cpp", "cxx", "h", "hpp", "sh",
+                )
             }
         }
 
@@ -53,9 +56,14 @@ tasks.register("verifyArchitecture") {
                 "androidx\\.compose",
                 "androidx\\.activity:activity-compose",
                 "de\\.robv\\.android\\.xposed\\.XposedHelpers",
+                "HiveForge",
+                "Hive license forge",
+                "Intercepted Hive\\.get",
             ).joinToString("|"),
+            RegexOption.IGNORE_CASE,
         )
-        val matches = sourceFiles(file("app/src")).flatMap { source ->
+        val sourceRoots = listOf(file("app/src"), file("scripts"))
+        val matches = sourceRoots.asSequence().flatMap(::sourceFiles).flatMap { source ->
             source.readLines().asSequence().mapIndexedNotNull { index, line ->
                 if (banned.containsMatchIn(line)) {
                     "${source.relativeTo(projectDir).invariantSeparatorsPath}:${index + 1}: ${line.trim()}"
@@ -66,6 +74,18 @@ tasks.register("verifyArchitecture") {
         }.toList()
         check(matches.isEmpty()) {
             "Banned legacy/service/compose references found:\n" + matches.take(80).joinToString("\n")
+        }
+
+        val obsoleteImplementations = listOf(
+            file("app/src/main/cpp/reeden_unlock.cpp"),
+            file("scripts/extract_hive_key.sh"),
+            file("scripts/test_hive_hook.sh"),
+        ).filter(java.io.File::exists)
+        check(obsoleteImplementations.isEmpty()) {
+            "Obsolete unlock implementations must not be kept in build-facing paths:\n" +
+                obsoleteImplementations.joinToString("\n") {
+                    it.relativeTo(projectDir).invariantSeparatorsPath
+                }
         }
     }
 }

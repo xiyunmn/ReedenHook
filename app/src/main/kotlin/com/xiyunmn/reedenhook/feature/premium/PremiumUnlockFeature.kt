@@ -13,22 +13,19 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Local Reeden Pro unlock - cached license publish + feature-gate scanner.
+ * Local Reeden Pro unlock - single native orchestrator.
  *
- * Strategy v0.4.1:
+ * Strategy v0.4.6:
  * 1. Load native `libreeden_unlock.so`
- * 2. Publish an encrypted local license cache from inside app.reeden
- * 3. Scan for Kwn's unique GZc.valid publish sequence and force null/false -> true
- * 4. Scan stable `ldur #0x27; decompress; tbz/tbnz #4` gates and rewrite them
- * 5. License path keeps UI notifier-friendly; gate path unlocks features even
- *    when Kwn does not run on cold start
+ * 2. Patch Kwn publication and field_27 gates in the same native install pass
+ * 3. Keep Java/Kotlin hooks limited to process lifecycle and native retry orchestration
  *
  * @see local_docs/forged_license_plan.md
  */
 object PremiumUnlockFeature {
     private val probeInstalled = AtomicBoolean(false)
     private val unlockInstalled = AtomicBoolean(false)
-    private val licenseMaintenanceInstalled = AtomicBoolean(false)
+    private val nativeRetriesScheduled = AtomicBoolean(false)
     private val active = AtomicBoolean(false)
     private val lifecycleGeneration = AtomicInteger(0)
     private val nativeStateLock = Any()
@@ -38,7 +35,7 @@ object PremiumUnlockFeature {
         beginInstallCycle()
         HookApi.i(
             "PremiumUnlockFeature.install process=${HostPackages.processLabel(processName)}, " +
-                "mode=license_plus_gate_scan (v0.4.1)",
+                "mode=single_pass_gate_scan (v0.4.6)",
         )
 
         installApplicationProbe(module)
@@ -72,12 +69,13 @@ object PremiumUnlockFeature {
             unlockInstalled.set(false)
         }
         probeInstalled.set(false)
-        licenseMaintenanceInstalled.set(false)
+        nativeRetriesScheduled.set(false)
     }
 
     private fun beginInstallCycle() {
         mainHandler.removeCallbacksAndMessages(null)
         lifecycleGeneration.incrementAndGet()
+        nativeRetriesScheduled.set(false)
         active.set(true)
     }
 
@@ -85,7 +83,11 @@ object PremiumUnlockFeature {
         if (!active.get()) {
             return
         }
-        // libapp.so may not be mapped at packageReady; retry a few times.
+        if (!nativeRetriesScheduled.compareAndSet(false, true)) {
+            return
+        }
+        // libapp.so may not be mapped at packageReady; one retry ladder is enough
+        // for packageReady, attach, and onCreate.
         val generation = lifecycleGeneration.get()
         val delaysMs = longArrayOf(0L, 300L, 800L, 1500L, 3000L, 5000L)
         delaysMs.forEachIndexed { index, delay ->
@@ -164,7 +166,6 @@ object PremiumUnlockFeature {
             HookApi.i(
                 "Application.attach observed: package=${context?.packageName}",
             )
-            scheduleLicensePublish(context, reason = "attach")
             scheduleNativeUnlock(reason = "attach")
         }
 
@@ -176,7 +177,6 @@ object PremiumUnlockFeature {
             id = "premium.Application.onCreate",
         ) { chain ->
             HookApi.i("Application.onCreate observed")
-            scheduleLicensePublish(chain.getThisObject() as? Context, reason = "onCreate")
             scheduleNativeUnlock(reason = "onCreate")
             val generation = lifecycleGeneration.get()
             mainHandler.postDelayed(
@@ -188,45 +188,5 @@ object PremiumUnlockFeature {
                 4000L,
             )
         }
-    }
-
-    private fun scheduleLicensePublish(context: Context?, reason: String) {
-        if (context == null || !HostPackages.isTargetPackage(context.packageName)) {
-            return
-        }
-        val appContext = context.applicationContext ?: context
-        val generation = lifecycleGeneration.get()
-        val delaysMs = longArrayOf(0L, 400L, 1200L, 2500L, 5000L, 10000L, 20000L, 45000L)
-        delaysMs.forEachIndexed { index, delay ->
-            mainHandler.postDelayed(
-                {
-                    if (active.get() && generation == lifecycleGeneration.get()) {
-                        LicenseCachePublisher.requestPublish(appContext, "$reason#$index")
-                    }
-                },
-                delay,
-            )
-        }
-        scheduleLicenseMaintenance(appContext, generation)
-    }
-
-    private fun scheduleLicenseMaintenance(context: Context, generation: Int) {
-        if (!licenseMaintenanceInstalled.compareAndSet(false, true)) {
-            return
-        }
-        fun postNext() {
-            mainHandler.postDelayed(
-                {
-                    if (active.get() && generation == lifecycleGeneration.get()) {
-                        LicenseCachePublisher.requestPublish(context, "maintenance")
-                        postNext()
-                    } else {
-                        licenseMaintenanceInstalled.set(false)
-                    }
-                },
-                60_000L,
-            )
-        }
-        postNext()
     }
 }

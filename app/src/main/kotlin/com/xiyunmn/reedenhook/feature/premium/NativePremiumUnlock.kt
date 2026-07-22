@@ -5,7 +5,7 @@ import com.xiyunmn.reedenhook.core.HookApi
 /**
  * JNI bridge to arm64 native unlock in `libreeden_unlock.so`.
  *
- * Hybrid strategy: license-publication scan + field_27 gate pattern scan.
+ * Single native install pass: license publication + field_27 gate fallback.
  * Dart AOT must not be intercepted with standard ABI trampolines (uses x15 as SP).
  */
 object NativePremiumUnlock {

@@ -1,8 +1,8 @@
 # ReedenHook
 
-**Version-resilient** LSPosed module for **Reeden** (`app.reeden`) - local Pro unlock via a hybrid license publisher and runtime gate scanner.
+**Version-resilient** LSPosed module for **Reeden** (`app.reeden`) - local Pro unlock via one native scanner pass.
 
-**v0.4.1**: slot-anchored scanning with full structural coverage, verified on Reeden 1.37.1, and clean hot-reload rollback.
+**v0.4.6**: single native orchestrator with Kwn publication and slot-anchored gate fallback, verified on Reeden 1.37.1, with clean hot-reload rollback.
 
 Stack: **libxposed API 102** (modern LSPosed)
 
@@ -17,7 +17,7 @@ Stack: **libxposed API 102** (modern LSPosed)
 
 ## Premium Gate Baseline
 
-Reverse-engineering baseline from Reeden 1.36.1; v0.4.1 discovers current RVAs
+Reverse-engineering baseline from Reeden 1.36.1; v0.4.6 discovers current RVAs
 and field-table slots at runtime.
 
 | Item | 1.36.1 baseline |
@@ -74,7 +74,7 @@ Architecture check runs on `:app:preBuild` (`verifyArchitecture`).
 ## Status
 
 - [x] Modern API 102 scaffold (libxposed)
-- [x] **v0.4.1 Hybrid Scanner**: license publication plus slot-anchored gate matching
+- [x] **v0.4.6 Single Native Scanner**: Kwn publication plus slot-anchored gate fallback
   - Discovers the `CZc.Fwn` slot from the dominant `field_27` gate cluster
   - Matches 90 adjacent gates plus 7 delayed/derived gates without hardcoded RVAs
   - **97 gates patched** (73 TBZ + 24 TBNZ) on Reeden 1.37.1
@@ -87,7 +87,7 @@ Architecture check runs on `:app:preBuild` (`verifyArchitecture`).
 
 ## How unlock works
 
-### v0.4.1 - Hybrid Runtime Scanner
+### v0.4.6 - Single Native Runtime Scanner
 
 Native library `libreeden_unlock.so` (arm64 only) performs smart pattern matching:
 
@@ -107,7 +107,7 @@ Native library `libreeden_unlock.so` (arm64 only) performs smart pattern matchin
 
 **Why slot-anchored?** `field_27` and bit 4 are generic Dart boolean shapes. Patching all 357 raw matches corrupts unrelated app logic; the field-table slot and supplemental control-flow signatures identify the `CZc.Fwn` family safely.
 
-**Retry logic**: Install attempts at multiple points (`packageReady`, `Application.attach`, `Application.onCreate`) until `libapp.so` is mapped. Retries carry a lifecycle generation, so callbacks queued before hot reload cannot reinstall restored patches.
+**Retry logic**: `packageReady`, `Application.attach`, and `Application.onCreate` all request the same native install ladder. Only one ladder is active per lifecycle generation, so lifecycle probes do not trigger competing hook plans.
 
 ### Known limitations
 
@@ -122,13 +122,13 @@ Native library `libreeden_unlock.so` (arm64 only) performs smart pattern matchin
 | v0.1.1 | Hardcoded 99 offsets | ❌ Version-locked | Deprecated |
 | v0.2.0 | Hive forge | ❌ No Java interception layer | Removed |
 | v0.3.0 | Broad runtime scanner | ⚠️ Generic bool false positives | Deprecated |
-| **v0.4.1** | **License + slot/structure scanner** | **✅ Fail-closed signatures** | **Current** |
+| **v0.4.6** | **Single-pass Kwn publication + slot/structure fallback** | **✅ Fail-closed signatures** | **Current** |
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 
 Inline hook trampolines are intentionally avoided because Dart AOT uses `x15`
-as its stack pointer. Install is retried after `packageReady`,
-`Application.attach`, and `Application.onCreate` until `libapp.so` is mapped.
+as its stack pointer. Lifecycle hooks only schedule the single native install
+ladder; there is no separate cache-publisher maintenance loop.
 
 ## Build / install
 
@@ -147,9 +147,9 @@ adb logcat -s ReedenHook ReedenHook.Native
 Expect: 
 ```
 I/ReedenHook.Native: feature gates patched tbz=73 tbnz=24 supplemental=7 failed=0
-I/ReedenHook.Native: install done mode=license_plus_gate_scan total_patches=99 license_rc=0 gates=97
+I/ReedenHook.Native: install done mode=single_pass_gate_scan total_patches=99 license_rc=0 gates=97
 I/ReedenHook: Native premium unlock installed (packageReady#0) code=0
-                status=mode=license_plus_gate_scan installed=1 patches=99
+                status=mode=single_pass_gate_scan installed=1 patches=99
 ```
 
 ## Cross-Version Compatibility
@@ -175,6 +175,6 @@ The scanner additionally requires the same field-table slot cluster and validate
 |---|---|---|---|
 | Host-signature regression corpus | High | Medium | Verifies scanner coverage before release |
 | Multi-version structural fixtures | Medium | Medium | Detects AOT codegen changes early |
-| Network intercept (block server sync) | Low | High | Prevents remote license checks |
+| Typed network intercept | Low | High | Only revisit if a real Dart response/body object can be preserved |
 
 See [local_docs/后续计划.md](local_docs/后续计划.md) for detailed roadmap.

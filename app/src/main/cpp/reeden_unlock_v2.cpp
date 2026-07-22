@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -19,14 +20,21 @@
 
 namespace {
 
-// Hybrid unlock strategy (v0.4.1):
+// Hybrid unlock strategy (v0.4.2):
 //
 // 1) License publication (primary, UI-friendly):
 //    Scan Kwn's unique GZc.valid -> null/false fallback -> setter sequence and
 //    force the fallback value to Dart `true`. When Kwn runs, Fwn.field_27 is
 //    published through the app's own ChangeNotifier path.
 //
-// 2) Feature-gate scan (fallback, functional unlock):
+// 2) checkLicense callback forge (cache-friendly):
+//    Scan the LicenseService async continuation after the network `post` await
+//    and redirect the "network response present" branch directly to the app's
+//    own `checkLicense success` tail. This prevents a real server failure from
+//    deleting the locally forged license cache while still using the app's own
+//    preference writers for lastCheckOkTime / lastCheckFailedCount.
+//
+// 3) Feature-gate scan (fallback, functional unlock):
 //    Scan stable AOT micro-sequences that test Fwn.field_27 bit4:
 //      ldur wN, [x?, #0x27]
 //      add  xN, xN, x28, lsl #32   ; decompress compressed pointer
@@ -39,12 +47,14 @@ namespace {
 // alone unlocks functions but may leave UI "upgrade" banners until Kwn runs.
 
 constexpr const char *kLibApp = "libapp.so";
-constexpr const char *kMode = "license_plus_gate_scan";
+constexpr const char *kMode = "license_plus_callback_gate_scan";
 constexpr uint32_t kNop = 0xD503201Fu;
 constexpr uint32_t kDartFalseOffset = 0x30u;
 constexpr uint32_t kDartTrueOffset = 0x20u;
 constexpr uint32_t kField27Imm9 = 0x27u;
 constexpr uint32_t kGzcValidImm9 = 0x0Fu;
+constexpr ptrdiff_t kCheckLicenseResponseBranchDelta = 0x1F8;
+constexpr ptrdiff_t kCheckLicenseSuccessTailDelta = 0x8FC;
 // Sentinel for "no static-field slot found".
 constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
 
@@ -71,6 +81,12 @@ struct LicensePublishSite {
     uintptr_t rva;
 };
 
+struct CheckLicenseSite {
+    uint32_t *response_branch;
+    uint32_t *success_tail;
+    uintptr_t rva;
+};
+
 enum class GateKind : uint8_t {
     kTbz = 0,
     kTbnz = 1,
@@ -92,9 +108,11 @@ std::atomic<int> g_gate_tbz{0};
 std::atomic<int> g_gate_tbnz{0};
 std::atomic<int> g_gate_supplemental{0};
 std::atomic<int> g_license_patches{0};
+std::atomic<int> g_check_license_patches{0};
 void *g_libapp_base = nullptr;
 size_t g_libapp_size = 0;
 uintptr_t g_license_publish_rva = 0;
+uintptr_t g_check_license_rva = 0;
 std::vector<Patch> g_patches;
 
 int find_lib_cb(struct dl_phdr_info *info, size_t, void *data) {
@@ -313,6 +331,18 @@ bool is_tbnz_bit4(uint32_t insn, uint32_t reg) {
         (insn & 0x1Fu) == reg;
 }
 
+bool is_tbnz_w0_bit4_with_delta(uint32_t insn, ptrdiff_t byte_delta) {
+    if (!is_tbnz_bit4(insn, 0u)) {
+        return false;
+    }
+    int32_t imm14 = static_cast<int32_t>((insn >> 5) & 0x3FFFu);
+    if ((imm14 & 0x2000) != 0) {
+        imm14 |= ~0x3FFF;
+    }
+    return static_cast<int64_t>(imm14) * static_cast<int64_t>(sizeof(uint32_t)) ==
+        static_cast<int64_t>(byte_delta);
+}
+
 bool decode_gate_kind(uint32_t insn, uint32_t reg, GateKind *kind) {
     if (is_tbz_bit4(insn, reg)) {
         *kind = GateKind::kTbz;
@@ -344,6 +374,29 @@ bool tbz_to_unconditional_b(uint32_t insn, uint32_t *out_b) {
     *out_b = 0x14000000u | (static_cast<uint32_t>(imm14) & 0x03FFFFFFu);
     return true;
 }
+
+bool retarget_tbz_tbnz(
+    uint32_t *branch, uint32_t insn, uint32_t *target, uint32_t *out_insn) {
+    if (((insn >> 24) & 0x7Eu) != 0x36u) {
+        return false;
+    }
+    const intptr_t delta =
+        reinterpret_cast<intptr_t>(target) - reinterpret_cast<intptr_t>(branch);
+    if ((delta % static_cast<intptr_t>(sizeof(uint32_t))) != 0) {
+        return false;
+    }
+    const intptr_t imm14 = delta / static_cast<intptr_t>(sizeof(uint32_t));
+    if (imm14 < -(1 << 13) || imm14 >= (1 << 13)) {
+        return false;
+    }
+    *out_insn =
+        (insn & ~(0x3FFFu << 5)) |
+        ((static_cast<uint32_t>(imm14) & 0x3FFFu) << 5);
+    return true;
+}
+
+bool segment_contains(
+    const ExecutableSegment &segment, const uint32_t *addr, size_t count);
 
 // ---------------------------------------------------------------------------
 // License publication scanner (unique Kwn micro-sequence)
@@ -382,6 +435,76 @@ std::vector<LicensePublishSite> scan_license_publish_sites(const ImageInfo &imag
                 reinterpret_cast<uintptr_t>(image.base);
             sites.push_back(
                 LicensePublishSite{&instructions[3], &instructions[4], rva});
+        }
+    }
+    return sites;
+}
+
+// ---------------------------------------------------------------------------
+// checkLicense callback scanner (network response -> success tail)
+// ---------------------------------------------------------------------------
+//
+// Reeden 1.36.1 and 1.37.1 compile the LicenseService checkLicense async
+// continuation with an identical local layout around the post-response branch:
+//
+//   mov  x1, x0
+//   stur x1, [fp, #-0x10]
+//   bl   Await
+//   mov  x1, x0
+//   stur x0, [fp, #-0x10]
+//   bl   responsePredicate
+//   tbnz w0, #4, response_validation   ; +0x1f8
+//   ... offline grace / failed-count path ...
+//   response_validation:
+//   ... success=false / activationInfo / key / device checks ...
+//   success_tail:                      ; +0x8fc from the tbnz
+//     ldr x0, [x26, #0x78]
+//     ... log "checkLicense success", lastCheckOkTime, failedCount=0 ...
+//
+// The bare tbnz shape is common, so the signature also checks the Await/result
+// setup immediately before it and the success-tail static-field access at the
+// fixed continuation-local delta.
+
+std::vector<CheckLicenseSite> scan_check_license_sites(const ImageInfo &image) {
+    std::vector<CheckLicenseSite> sites;
+
+    for (const ExecutableSegment &segment : image.executable_segments) {
+        if (segment.size < static_cast<size_t>(kCheckLicenseSuccessTailDelta + 16)) {
+            continue;
+        }
+        const size_t min_offset = 6 * sizeof(uint32_t);
+        const size_t limit =
+            segment.size - static_cast<size_t>(kCheckLicenseSuccessTailDelta + 16);
+        for (size_t offset = min_offset; offset <= limit; offset += sizeof(uint32_t)) {
+            auto *instructions =
+                reinterpret_cast<uint32_t *>(segment.start + offset);
+
+            if (!is_tbnz_w0_bit4_with_delta(
+                    instructions[0], kCheckLicenseResponseBranchDelta) ||
+                instructions[-6] != 0xAA0003E1u ||  // mov x1, x0
+                instructions[-5] != 0xF81F03A1u ||  // stur x1, [fp, #-0x10]
+                !is_bl(instructions[-4]) ||         // Await
+                instructions[-3] != 0xAA0003E1u ||  // mov x1, x0
+                instructions[-2] != 0xF81F03A0u ||  // stur x0, [fp, #-0x10]
+                !is_bl(instructions[-1]) ||         // response predicate
+                instructions[1] != 0xF9403F40u) {   // ldr x0, [x26, #0x78]
+                continue;
+            }
+
+            auto *success_tail = reinterpret_cast<uint32_t *>(
+                reinterpret_cast<uint8_t *>(instructions) +
+                kCheckLicenseSuccessTailDelta);
+            if (!segment_contains(segment, success_tail, 4) ||
+                success_tail[0] != 0xF9403F40u ||   // ldr x0, [x26, #0x78]
+                success_tail[2] != 0xF9402370u ||   // ldr x16, [x27, #0x40]
+                success_tail[3] != 0x6B10001Fu) {   // cmp w0, w16
+                continue;
+            }
+
+            const uintptr_t rva =
+                reinterpret_cast<uintptr_t>(instructions) -
+                reinterpret_cast<uintptr_t>(image.base);
+            sites.push_back(CheckLicenseSite{instructions, success_tail, rva});
         }
     }
     return sites;
@@ -661,6 +784,30 @@ int apply_license_publish_patches(const LicensePublishSite &site) {
     return 0;
 }
 
+int apply_check_license_patch(const CheckLicenseSite &site) {
+    uint32_t patched = 0;
+    if (!retarget_tbz_tbnz(
+            site.response_branch,
+            *site.response_branch,
+            site.success_tail,
+            &patched)) {
+        return -8;
+    }
+    if (!patch_instruction(site.response_branch, patched)) {
+        return -9;
+    }
+
+    g_check_license_rva = site.rva;
+    g_check_license_patches.store(1);
+    LOGI(
+        "checkLicense response branch redirected rva=0x%zx success_tail=0x%zx",
+        static_cast<size_t>(site.rva),
+        static_cast<size_t>(
+            reinterpret_cast<uintptr_t>(site.success_tail) -
+            reinterpret_cast<uintptr_t>(g_libapp_base)));
+    return 0;
+}
+
 // Patch only gates anchored on `dominant_slot` (the CZc.Fwn cluster). Gates on
 // other slots / kNoSlot are unrelated bool checks and MUST be left alone, or the
 // app's core screens break.
@@ -762,7 +909,30 @@ int do_install_locked() {
         }
     }
 
-    // --- Phase 2: feature-gate pattern scan (functional unlock) ---
+    // --- Phase 2: checkLicense callback forge (best-effort unique hit) ---
+    const std::vector<CheckLicenseSite> check_sites =
+        scan_check_license_sites(image);
+    int check_rc = 0;
+    if (check_sites.empty()) {
+        LOGW("checkLicense callback pattern not found; continuing with fallback patches");
+        check_rc = 1;
+    } else if (check_sites.size() != 1) {
+        LOGW(
+            "checkLicense callback pattern ambiguous matches=%zu; skipping",
+            check_sites.size());
+        for (const CheckLicenseSite &site : check_sites) {
+            LOGW("checkLicense candidate rva=0x%zx", static_cast<size_t>(site.rva));
+        }
+        check_rc = 2;
+    } else {
+        const int rc = apply_check_license_patch(check_sites.front());
+        if (rc != 0) {
+            LOGE("checkLicense callback patch failed code=%d", rc);
+            check_rc = rc;
+        }
+    }
+
+    // --- Phase 3: feature-gate pattern scan (functional unlock) ---
     std::vector<GateSite> gates = scan_feature_gates(image);
     const uint32_t dominant_slot = dominant_gate_slot(gates);
     if (gates.empty() || dominant_slot == kNoSlot) {
@@ -796,14 +966,17 @@ int do_install_locked() {
     g_patch_count.store(static_cast<int>(g_patches.size()));
     g_installed.store(true);
     LOGI(
-        "install done mode=%s total_patches=%d license_rc=%d gates=%d site=0x%zx",
+        "install done mode=%s total_patches=%d license_rc=%d check_rc=%d "
+        "gates=%d license_site=0x%zx check_site=0x%zx",
         kMode,
         g_patch_count.load(),
         license_rc,
+        check_rc,
         gate_ok,
-        static_cast<size_t>(g_license_publish_rva));
-    // 0 = full success (license unique + gates). 1 = gates only / license soft miss.
-    return (license_rc == 0 && gate_ok > 0) ? 0 : 1;
+        static_cast<size_t>(g_license_publish_rva),
+        static_cast<size_t>(g_check_license_rva));
+    // 0 = full success. 1 = functional fallback success with a soft miss.
+    return (license_rc == 0 && check_rc == 0 && gate_ok > 0) ? 0 : 1;
 }
 
 void do_uninstall_locked() {
@@ -827,7 +1000,9 @@ void do_uninstall_locked() {
     g_gate_tbnz.store(0);
     g_gate_supplemental.store(0);
     g_license_patches.store(0);
+    g_check_license_patches.store(0);
     g_license_publish_rva = 0;
+    g_check_license_rva = 0;
     g_installed.store(false);
     LOGI("uninstalled and restored patches");
 }
@@ -877,8 +1052,9 @@ Java_com_xiyunmn_reedenhook_feature_premium_NativePremiumUnlock_nativeStatus(
         buf,
         sizeof(buf),
         "mode=%s installed=%d enabled=%d base=%p size=0x%zx "
-        "license_site=0x%zx license_patches=%d gates_tbz=%d gates_tbnz=%d "
-        "gates_supplemental=%d patches=%d",
+        "license_site=0x%zx license_patches=%d check_site=0x%zx "
+        "check_patches=%d gates_tbz=%d gates_tbnz=%d gates_supplemental=%d "
+        "patches=%d",
         kMode,
         g_installed.load() ? 1 : 0,
         g_enabled.load() ? 1 : 0,
@@ -886,6 +1062,8 @@ Java_com_xiyunmn_reedenhook_feature_premium_NativePremiumUnlock_nativeStatus(
         g_libapp_size,
         static_cast<size_t>(g_license_publish_rva),
         g_license_patches.load(),
+        static_cast<size_t>(g_check_license_rva),
+        g_check_license_patches.load(),
         g_gate_tbz.load(),
         g_gate_tbnz.load(),
         g_gate_supplemental.load(),
@@ -898,6 +1076,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
-    LOGI("JNI_OnLoad reeden_unlock v0.4.1 hybrid license+gate scan");
+    LOGI("JNI_OnLoad reeden_unlock v0.4.2 hybrid license+callback+gate scan");
     return JNI_VERSION_1_6;
 }

@@ -1,6 +1,6 @@
 # ReedenHook
 
-ReedenHook 是面向 Reeden 的 LSPosed 模块，用于在本机授权的测试环境中保持会员状态与功能解锁稳定。模块基于现代 libxposed API 102 开发，运行时不需要 root。
+ReedenHook 是面向 Reeden 的 LSPosed 模块，用于在本机授权的测试环境中保持会员状态与功能解锁稳定。模块基于现代 libxposed API 102 开发。
 
 当前主要适配：
 
@@ -21,7 +21,7 @@ com.xiyunmn.reedenhook
 1. 在支持 libxposed API 102 的 LSPosed 中安装并启用模块。
 2. 将作用域只设置为 Reeden（`app.reeden`）。
 3. 强制停止并重新启动 Reeden。
-4. 打开 Reeden 后确认会员状态和会员功能是否保持可用。
+4. 打开 Reeden 后确认会员状态和会员功能是否保持可用（有时可能需要第二次冷启动后生效）。
 5. 如需排查问题，优先查看模块文件日志。
 
 模块没有独立设置界面；安装、启用作用域并重启宿主后自动生效。

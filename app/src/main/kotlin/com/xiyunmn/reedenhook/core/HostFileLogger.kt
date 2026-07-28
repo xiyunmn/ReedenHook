@@ -12,17 +12,12 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Small append-only file logger for the host process.
- *
- * Primary sink:
- *   /data/user/<user>/app.reeden/files/reedenhook/logs/reedenhook.log
- *
- * Mirror sink, when Android exposes it:
- *   /sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log
+ * Small rotating file logger for the host process private directory.
  */
 object HostFileLogger {
     private const val RELATIVE_LOG_PATH = "reedenhook/logs/reedenhook.log"
-    private const val MAX_LOG_BYTES = 512 * 1024L
+    private const val MAX_LOG_BYTES = 256 * 1024L
+    private const val MAX_LOG_FILES = 3
     private const val MAX_PENDING_LINES = 256
     private const val MAX_LINE_CHARS = 8_000
 
@@ -31,7 +26,7 @@ object HostFileLogger {
     private val dateFormat = ThreadLocal.withInitial {
         SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     }
-    private val sinks = ArrayList<File>(2)
+    private val sinks = ArrayList<File>(1)
 
     @Volatile
     private var currentPaths = Paths(privatePath = null, externalPath = null, changed = false)
@@ -44,10 +39,7 @@ object HostFileLogger {
 
     fun configure(context: Context, reason: String): Paths {
         val privateFile = runCatching { File(context.filesDir, RELATIVE_LOG_PATH) }.getOrNull()
-        val externalFile = runCatching {
-            context.getExternalFilesDir(null)?.let { File(it, RELATIVE_LOG_PATH) }
-        }.getOrNull()
-        val nextSinks = listOfNotNull(privateFile, externalFile).distinctBy { it.absolutePath }
+        val nextSinks = listOfNotNull(privateFile).distinctBy { it.absolutePath }
         val nextSignature = nextSinks.joinToString("|") { it.absolutePath }
 
         synchronized(lock) {
@@ -58,11 +50,12 @@ object HostFileLogger {
             }
             currentPaths = Paths(
                 privatePath = privateFile?.absolutePath,
-                externalPath = externalFile?.absolutePath,
+                externalPath = null,
                 changed = changed,
             )
 
             if (sinks.isNotEmpty()) {
+                sinks.forEach(::cleanupExcessRotatedFiles)
                 while (!pendingLines.isEmpty()) {
                     appendLineLocked(pendingLines.removeFirst())
                 }
@@ -71,7 +64,7 @@ object HostFileLogger {
                         priority = Log.INFO,
                         tag = "ReedenHook.FileLog",
                         message = "configured reason=$reason private=${privateFile?.absolutePath} " +
-                            "external=${externalFile?.absolutePath ?: "n/a"}",
+                            "maxBytes=$MAX_LOG_BYTES maxFiles=$MAX_LOG_FILES",
                     ),
                 )
             }
@@ -149,12 +142,36 @@ object HostFileLogger {
         if (!file.exists() || file.length() + incomingBytes <= MAX_LOG_BYTES) {
             return
         }
-        val backup = File(file.parentFile, "${file.name}.1")
+        val parent = file.parentFile ?: return
         runCatching {
-            if (backup.exists()) {
-                backup.delete()
+            cleanupExcessRotatedFiles(file)
+            for (index in (MAX_LOG_FILES - 1) downTo 1) {
+                val source = if (index == 1) {
+                    file
+                } else {
+                    File(parent, "${file.name}.${index - 1}")
+                }
+                val target = File(parent, "${file.name}.$index")
+                if (!source.exists()) {
+                    continue
+                }
+                if (target.exists()) {
+                    target.delete()
+                }
+                source.renameTo(target)
             }
-            file.renameTo(backup)
+        }
+    }
+
+    private fun cleanupExcessRotatedFiles(file: File) {
+        val parent = file.parentFile ?: return
+        runCatching {
+            parent.listFiles { candidate ->
+                val suffix = candidate.name.removePrefix("${file.name}.")
+                candidate.isFile &&
+                    candidate.name.startsWith("${file.name}.") &&
+                    suffix.toIntOrNull()?.let { it >= MAX_LOG_FILES } == true
+            }?.forEach { it.delete() }
         }
     }
 }

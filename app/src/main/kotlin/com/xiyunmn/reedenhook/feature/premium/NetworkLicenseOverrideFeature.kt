@@ -47,6 +47,9 @@ object NetworkLicenseOverrideFeature {
     private const val ACTIVATED_AT = "2026-07-22T00:00:00.000Z"
     private const val HIVE_SETTINGS_RELATIVE_PATH = "databases/settings.hive"
     private const val HIVE_SETTINGS_FILE_NAME = "settings.hive"
+    private const val HIVE_BACKUP_FILE_NAME = "settings.hive.reedenhook.bak"
+    private const val HIVE_LEGACY_BACKUP_PREFIX = "settings.hive.reedenhook.bak."
+    private const val HIVE_TEMP_FILE_NAME = "settings.hive.reedenhook.tmp"
     private const val HIVE_STRING_TYPE = 0x04
     private const val HIVE_INT_TYPE = 0x01
     private const val HIVE_KEY_STRING_TYPE = 0x01
@@ -73,6 +76,7 @@ object NetworkLicenseOverrideFeature {
     private val localRepairChecks = AtomicInteger(0)
     private val localRepairWrites = AtomicInteger(0)
     private val localRepairSkips = AtomicInteger(0)
+    private val localBackupCleanupDone = AtomicBoolean(false)
     private val networkGuardStarted = AtomicBoolean(false)
     private val orchestratorLock = Any()
     private val primaryMissingFailures = AtomicInteger(0)
@@ -152,6 +156,7 @@ object NetworkLicenseOverrideFeature {
         synchronized(localRepairLock) {
             localLastRepairAt = 0L
             localBackupDone = false
+            localBackupCleanupDone.set(false)
         }
     }
 
@@ -313,6 +318,7 @@ object NetworkLicenseOverrideFeature {
                 if (parent != null && !parent.exists() && !parent.mkdirs()) {
                     error("cannot create ${parent.absolutePath}")
                 }
+                parent?.let(::cleanupLegacyLocalBackups)
 
                 val data = if (hiveFile.exists()) hiveFile.readBytes() else ByteArray(0)
                 val inspection = inspectHive(data)
@@ -336,16 +342,6 @@ object NetworkLicenseOverrideFeature {
                     )
                 }
 
-                if (hiveFile.exists() && !localBackupDone) {
-                    val backup = File(
-                        hiveFile.parentFile,
-                        "settings.hive.reedenhook.bak.${System.currentTimeMillis()}",
-                    )
-                    runCatching { hiveFile.copyTo(backup, overwrite = false) }
-                        .onFailure { HookApi.w("local license backup failed: ${it.message}", TAG) }
-                    localBackupDone = true
-                }
-
                 val base = data.copyOf(inspection.validPrefixLength)
                 val repaired = base + buildLocalLicenseFrames()
                 if (inspection.validPrefixLength == data.size && hiveFile.exists()) {
@@ -354,7 +350,11 @@ object NetworkLicenseOverrideFeature {
                         out.fd.sync()
                     }
                 } else {
-                    val tempFile = File(hiveFile.parentFile, "settings.hive.reedenhook.tmp")
+                    if (hiveFile.exists() && !localBackupDone) {
+                        backupLocalHiveForRewrite(hiveFile)
+                        localBackupDone = true
+                    }
+                    val tempFile = File(hiveFile.parentFile, HIVE_TEMP_FILE_NAME)
                     tempFile.writeBytes(repaired)
                     if (hiveFile.exists() && !hiveFile.delete()) {
                         error("cannot replace ${hiveFile.absolutePath}")
@@ -425,6 +425,83 @@ object NetworkLicenseOverrideFeature {
                     throwable = throwable,
                 )
             }
+        }
+    }
+
+    private fun cleanupLegacyLocalBackups(parent: File) {
+        if (!localBackupCleanupDone.compareAndSet(false, true)) {
+            return
+        }
+        val legacyBackups = runCatching {
+            parent.listFiles { file ->
+                file.isFile && file.name.startsWith(HIVE_LEGACY_BACKUP_PREFIX)
+            }?.toList().orEmpty()
+        }.getOrElse { throwable ->
+            HookApi.w("local license backup cleanup failed: ${throwable.message}", TAG)
+            return
+        }
+        if (legacyBackups.isEmpty()) {
+            return
+        }
+
+        val fixedBackup = File(parent, HIVE_BACKUP_FILE_NAME)
+        var keepLegacy: File? = null
+        if (!fixedBackup.exists()) {
+            val newest = legacyBackups.maxByOrNull { it.lastModified() }
+            if (newest != null) {
+                val promoted = runCatching {
+                    newest.renameTo(fixedBackup) || run {
+                        newest.copyTo(fixedBackup, overwrite = false)
+                        newest.delete()
+                        true
+                    }
+                }.onFailure { throwable ->
+                    HookApi.w("local license backup promote failed: ${throwable.message}", TAG)
+                }.getOrDefault(false)
+                if (!promoted) {
+                    keepLegacy = newest
+                }
+            }
+        }
+
+        var deleted = 0
+        var failed = 0
+        var deletedBytes = 0L
+        legacyBackups.forEach { backup ->
+            if (backup == keepLegacy || !backup.exists()) {
+                return@forEach
+            }
+            val length = backup.length()
+            if (runCatching { backup.delete() }.getOrDefault(false)) {
+                deleted += 1
+                deletedBytes += length
+            } else {
+                failed += 1
+            }
+        }
+        if (deleted > 0 || failed > 0) {
+            val message =
+                "local license legacy backups cleanup deleted=$deleted failed=$failed " +
+                    "freedBytes=$deletedBytes fixed=${fixedBackup.exists()} dir=${parent.absolutePath}"
+            if (failed > 0) {
+                HookApi.w(message, TAG)
+            } else {
+                HookApi.i(message, TAG)
+            }
+        }
+    }
+
+    private fun backupLocalHiveForRewrite(hiveFile: File) {
+        val parent = hiveFile.parentFile ?: return
+        val backup = File(parent, HIVE_BACKUP_FILE_NAME)
+        runCatching {
+            hiveFile.copyTo(backup, overwrite = true)
+            HookApi.i(
+                "local license rewrite backup updated bytes=${backup.length()} path=${backup.absolutePath}",
+                TAG,
+            )
+        }.onFailure { throwable ->
+            HookApi.w("local license rewrite backup failed: ${throwable.message}", TAG)
         }
     }
 
@@ -558,7 +635,7 @@ object NetworkLicenseOverrideFeature {
                     if (isAotFallbackStillArmed(generation) && !aotFallbackInstalled.get()) {
                         HookApi.e(
                             "AOT fallback exhausted reason=$reason status=${NativePremiumUnlock.status()} " +
-                                "log=${HookApi.currentFileLogPaths().externalPath ?: HookApi.currentFileLogPaths().privatePath}",
+                                "log=${HookApi.currentFileLogPaths().privatePath}",
                             TAG,
                         )
                     }

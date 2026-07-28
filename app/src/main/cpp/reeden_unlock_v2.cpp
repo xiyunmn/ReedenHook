@@ -25,10 +25,11 @@
 
 namespace {
 
-constexpr size_t kNativeLogPathCount = 2;
+constexpr size_t kNativeLogPathCount = 1;
 constexpr size_t kNativeLogPathMax = 512;
 constexpr size_t kNativeLogLineMax = 1536;
-constexpr off_t kNativeLogMaxBytes = 512 * 1024;
+constexpr off_t kNativeLogMaxBytes = 256 * 1024;
+constexpr size_t kNativeLogMaxFiles = 3;
 
 std::mutex g_native_log_mu;
 char g_native_log_paths[kNativeLogPathCount][kNativeLogPathMax] = {};
@@ -48,19 +49,40 @@ void write_all(int fd, const char *data, size_t len) {
     }
 }
 
+void cleanup_excess_native_logs(const char *path) {
+    for (size_t index = kNativeLogMaxFiles; index <= 16; ++index) {
+        char extra[kNativeLogPathMax + 8] {};
+        const int len = snprintf(extra, sizeof(extra), "%s.%zu", path, index);
+        if (len <= 0 || static_cast<size_t>(len) >= sizeof(extra)) {
+            continue;
+        }
+        unlink(extra);
+    }
+}
+
 void rotate_native_log_if_needed(const char *path, size_t incoming_bytes) {
     struct stat st {};
     if (stat(path, &st) != 0 ||
         st.st_size + static_cast<off_t>(incoming_bytes) <= kNativeLogMaxBytes) {
         return;
     }
-    char backup[kNativeLogPathMax + 4] {};
-    const int len = snprintf(backup, sizeof(backup), "%s.1", path);
-    if (len <= 0 || static_cast<size_t>(len) >= sizeof(backup)) {
-        return;
+
+    cleanup_excess_native_logs(path);
+    for (size_t index = kNativeLogMaxFiles - 1; index > 0; --index) {
+        char source[kNativeLogPathMax + 8] {};
+        char target[kNativeLogPathMax + 8] {};
+        const int source_len = index == 1 ?
+            snprintf(source, sizeof(source), "%s", path) :
+            snprintf(source, sizeof(source), "%s.%zu", path, index - 1);
+        const int target_len = snprintf(target, sizeof(target), "%s.%zu", path, index);
+        if (source_len <= 0 || target_len <= 0 ||
+            static_cast<size_t>(source_len) >= sizeof(source) ||
+            static_cast<size_t>(target_len) >= sizeof(target)) {
+            continue;
+        }
+        unlink(target);
+        rename(source, target);
     }
-    unlink(backup);
-    rename(path, backup);
 }
 
 void append_native_file_log(const char *level, const char *message) {
@@ -1225,7 +1247,9 @@ void set_native_log_path(JNIEnv *env, jstring value, size_t index) {
 void native_log_paths_snapshot(char *primary, size_t primary_size, char *mirror, size_t mirror_size) {
     std::lock_guard<std::mutex> lock(g_native_log_mu);
     snprintf(primary, primary_size, "%s", g_native_log_paths[0]);
-    snprintf(mirror, mirror_size, "%s", g_native_log_paths[1]);
+    if (mirror_size > 0) {
+        mirror[0] = '\0';
+    }
 }
 
 }  // namespace
@@ -1295,16 +1319,17 @@ Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeSetFileLogP
     jclass,
     jstring private_path,
     jstring external_path) {
+    (void) external_path;
     set_native_log_path(env, private_path, 0);
-    set_native_log_path(env, external_path, 1);
 
     char primary[kNativeLogPathMax] {};
     char mirror[kNativeLogPathMax] {};
     native_log_paths_snapshot(primary, sizeof(primary), mirror, sizeof(mirror));
     LOGI(
-        "network guard file logging configured private=%s external=%s",
+        "network guard file logging configured private=%s maxBytes=%lld maxFiles=%zu",
         primary[0] != '\0' ? primary : "n/a",
-        mirror[0] != '\0' ? mirror : "n/a");
+        static_cast<long long>(kNativeLogMaxBytes),
+        kNativeLogMaxFiles);
 }
 
 extern "C" JNIEXPORT jint JNICALL

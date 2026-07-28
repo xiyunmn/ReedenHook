@@ -23,9 +23,6 @@ object NativeNetworkGuard {
     private var privateLogPath: String? = null
 
     @Volatile
-    private var externalLogPath: String? = null
-
-    @Volatile
     private var appliedLogSignature: String? = null
 
     fun ensureLoaded(): Boolean {
@@ -53,7 +50,6 @@ object NativeNetworkGuard {
 
     fun configureFileLogging(paths: HostFileLogger.Paths) {
         privateLogPath = paths.privatePath
-        externalLogPath = paths.externalPath
         if (libraryLoaded) {
             applyFileLogPaths()
         }
@@ -100,11 +96,11 @@ object NativeNetworkGuard {
         if (!libraryLoaded) {
             return
         }
-        val signature = "${privateLogPath.orEmpty()}|${externalLogPath.orEmpty()}"
+        val signature = privateLogPath.orEmpty()
         if (appliedLogSignature == signature) {
             return
         }
-        runCatching { nativeSetFileLogPaths(privateLogPath, externalLogPath) }
+        runCatching { nativeSetFileLogPaths(privateLogPath, null) }
             .onSuccess { appliedLogSignature = signature }
             .onFailure { HookApi.e("NativeNetworkGuard file log config failed", TAG, it) }
     }

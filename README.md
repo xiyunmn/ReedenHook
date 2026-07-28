@@ -32,7 +32,7 @@ com.xiyunmn.reedenhook
 - 自动写入、检查并修复宿主本地许可证缓存。
 - 只阻断许可证校验相关域名，不影响宿主其它网络请求。
 - 当主路径无法保持本地许可证存在时，才启用 AOT gate 兜底。
-- 提供宿主私有目录和外部镜像文件日志，便于直接通过 adb 排查。
+- 提供宿主私有目录文件日志，并限制单文件大小和轮转数量。
 
 ## 当前策略
 
@@ -51,7 +51,6 @@ AOT gate -> fallback only
 - 宿主版本更新后，请先确认基础启动、会员状态和核心会员功能是否正常。
 - 不建议同时启用其它会修改 Reeden 会员、许可证或网络校验逻辑的模块。
 - 如果会员状态启动后很快回退，优先查看文件日志中的 `local license`、`network guard` 和 `getaddrinfo` 记录。
-- 模块自身不需要 root；root 仅可作为手工取证或一次性测试手段，不属于模块运行路径。
 
 ## 日志
 
@@ -68,13 +67,13 @@ ReedenHook.Native
 
 ```text
 /data/user/0/app.reeden/files/reedenhook/logs/reedenhook.log
-/sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log
 ```
+
+文件日志只写入宿主私有目录，按 256KB 单文件、最多 3 个文件轮转。
 
 常用查看命令：
 
 ```powershell
-adb shell tail -n 160 /sdcard/Android/data/app.reeden/files/reedenhook/logs/reedenhook.log
 adb logcat -d -s ReedenHook ReedenHook.Module ReedenHook.Network ReedenHook.Native
 ```
 

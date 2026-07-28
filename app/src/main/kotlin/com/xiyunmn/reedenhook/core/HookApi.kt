@@ -29,8 +29,7 @@ object HookApi {
 
     fun configureHostFileLogging(context: Context, reason: String): HostFileLogger.Paths {
         val paths = HostFileLogger.configure(context, reason)
-        val message = "File logging active reason=$reason private=${paths.privatePath} " +
-            "external=${paths.externalPath ?: "n/a"}"
+        val message = "File logging active reason=$reason private=${paths.privatePath}"
         if (paths.changed) {
             i(message)
         } else {

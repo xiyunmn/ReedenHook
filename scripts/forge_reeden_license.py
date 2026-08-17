@@ -307,7 +307,7 @@ def main() -> int:
         help="output forged settings.hive",
     )
     parser.add_argument("--email", default="reedenhook@local")
-    parser.add_argument("--license-key", default="RH-LOCAL-UNLOCK-1.36.1")
+    parser.add_argument("--license-key", default="RH-LOCAL-UNLOCK-1.38.1")
     parser.add_argument("--order-id", default="reedenhook-local")
     parser.add_argument("--activated-at", default="2026-07-22T00:00:00.000Z")
     parser.add_argument(

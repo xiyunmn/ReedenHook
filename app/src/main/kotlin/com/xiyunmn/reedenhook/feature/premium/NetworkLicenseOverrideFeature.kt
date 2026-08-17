@@ -42,14 +42,13 @@ import javax.crypto.spec.SecretKeySpec
  */
 object NetworkLicenseOverrideFeature {
     private const val TAG = "ReedenHook.Network"
-    private const val TOKEN = "reedenhook-local-token"
-    private const val DEVICE_ID_FALLBACK = "reedenhook-device"
+    private const val TOKEN = "local-license-token-v1381"
+    private const val DEVICE_ID_FALLBACK = "local-device-v1381"
     private const val ACTIVATED_AT = "2026-07-22T00:00:00.000Z"
     private const val HIVE_SETTINGS_RELATIVE_PATH = "databases/settings.hive"
     private const val HIVE_SETTINGS_FILE_NAME = "settings.hive"
-    private const val HIVE_BACKUP_FILE_NAME = "settings.hive.reedenhook.bak"
-    private const val HIVE_LEGACY_BACKUP_PREFIX = "settings.hive.reedenhook.bak."
-    private const val HIVE_TEMP_FILE_NAME = "settings.hive.reedenhook.tmp"
+    private const val HIVE_TEMP_FILE_NAME = "settings.hive.tmp"
+    private const val LEGACY_LOG_DIRECTORY = "reedenhook"
     private const val HIVE_STRING_TYPE = 0x04
     private const val HIVE_INT_TYPE = 0x01
     private const val HIVE_KEY_STRING_TYPE = 0x01
@@ -76,16 +75,15 @@ object NetworkLicenseOverrideFeature {
     private val localRepairChecks = AtomicInteger(0)
     private val localRepairWrites = AtomicInteger(0)
     private val localRepairSkips = AtomicInteger(0)
-    private val localBackupCleanupDone = AtomicBoolean(false)
     private val networkGuardStarted = AtomicBoolean(false)
     private val orchestratorLock = Any()
     private val primaryMissingFailures = AtomicInteger(0)
     private val aotFallbackArmed = AtomicBoolean(false)
     private val aotFallbackInstallStarted = AtomicBoolean(false)
     private val aotFallbackInstalled = AtomicBoolean(false)
+    private val aotCompatibilityRequired = AtomicBoolean(false)
     private val aotFallbackGeneration = AtomicInteger(0)
     private var localLastRepairAt = 0L
-    private var localBackupDone = false
     @Volatile
     private var primaryFirstMissingAt = 0L
     @Volatile
@@ -108,10 +106,15 @@ object NetworkLicenseOverrideFeature {
                 "mode=network_local_primary_aot_fallback hosts=${targetHosts.joinToString(",")}",
             TAG,
         )
+        val runtimeIntegrityOverrideInstalled = RuntimeIntegrityOverrideFeature.install(module, classLoader)
+        aotCompatibilityRequired.set(runtimeIntegrityOverrideInstalled)
         startNativeNetworkGuard("feature.install")
         installLocalLicenseRepairHooks(module)
         installUrlHooks(module)
         installConnectionHooks(module, classLoader)
+        if (runtimeIntegrityOverrideInstalled) {
+            armAotFallback("host_1.38.1_runtime_integrity_compatibility")
+        }
     }
 
     fun installAfterHotReload(
@@ -148,6 +151,7 @@ object NetworkLicenseOverrideFeature {
         aotFallbackArmed.set(false)
         aotFallbackInstallStarted.set(false)
         aotFallbackInstalled.set(false)
+        aotCompatibilityRequired.set(false)
         aotFallbackGeneration.incrementAndGet()
         NativeNetworkGuard.setEnabled(false)
         NativePremiumUnlock.setEnabled(false)
@@ -155,8 +159,6 @@ object NetworkLicenseOverrideFeature {
         transitionTo(OrchestratorState.PRIMARY_START, "hotReload.cleanup")
         synchronized(localRepairLock) {
             localLastRepairAt = 0L
-            localBackupDone = false
-            localBackupCleanupDone.set(false)
         }
     }
 
@@ -193,8 +195,7 @@ object NetworkLicenseOverrideFeature {
             return
         }
 
-        val logPaths = HookApi.configureHostFileLogging(appContext, reason)
-        NativeNetworkGuard.configureFileLogging(logPaths)
+        cleanupLegacyArtifacts(appContext)
         startNativeNetworkGuard(reason)
         handleLocalLicenseCheck(appContext, "$reason.immediate")
         if (!localGuardianStarted.compareAndSet(false, true)) {
@@ -220,7 +221,6 @@ object NetworkLicenseOverrideFeature {
                     handleLocalLicenseCheck(appContext, "guardian.poll")
                 }
             },
-            "ReedenHook-LicenseGuardian",
         ).apply {
             isDaemon = true
             start()
@@ -259,7 +259,6 @@ object NetworkLicenseOverrideFeature {
                 networkGuardStarted.set(false)
                 HookApi.w("NativeNetworkGuard not installed after retries status=${NativeNetworkGuard.status()}", TAG)
             },
-            "ReedenHook-NetworkGuard",
         ).apply {
             isDaemon = true
             start()
@@ -318,8 +317,6 @@ object NetworkLicenseOverrideFeature {
                 if (parent != null && !parent.exists() && !parent.mkdirs()) {
                     error("cannot create ${parent.absolutePath}")
                 }
-                parent?.let(::cleanupLegacyLocalBackups)
-
                 val data = if (hiveFile.exists()) hiveFile.readBytes() else ByteArray(0)
                 val inspection = inspectHive(data)
                 if (inspection.completeForgedState && inspection.validPrefixLength == data.size) {
@@ -350,10 +347,6 @@ object NetworkLicenseOverrideFeature {
                         out.fd.sync()
                     }
                 } else {
-                    if (hiveFile.exists() && !localBackupDone) {
-                        backupLocalHiveForRewrite(hiveFile)
-                        localBackupDone = true
-                    }
                     val tempFile = File(hiveFile.parentFile, HIVE_TEMP_FILE_NAME)
                     tempFile.writeBytes(repaired)
                     if (hiveFile.exists() && !hiveFile.delete()) {
@@ -428,80 +421,18 @@ object NetworkLicenseOverrideFeature {
         }
     }
 
-    private fun cleanupLegacyLocalBackups(parent: File) {
-        if (!localBackupCleanupDone.compareAndSet(false, true)) {
-            return
-        }
-        val legacyBackups = runCatching {
-            parent.listFiles { file ->
-                file.isFile && file.name.startsWith(HIVE_LEGACY_BACKUP_PREFIX)
-            }?.toList().orEmpty()
-        }.getOrElse { throwable ->
-            HookApi.w("local license backup cleanup failed: ${throwable.message}", TAG)
-            return
-        }
-        if (legacyBackups.isEmpty()) {
-            return
-        }
-
-        val fixedBackup = File(parent, HIVE_BACKUP_FILE_NAME)
-        var keepLegacy: File? = null
-        if (!fixedBackup.exists()) {
-            val newest = legacyBackups.maxByOrNull { it.lastModified() }
-            if (newest != null) {
-                val promoted = runCatching {
-                    newest.renameTo(fixedBackup) || run {
-                        newest.copyTo(fixedBackup, overwrite = false)
-                        newest.delete()
-                        true
-                    }
-                }.onFailure { throwable ->
-                    HookApi.w("local license backup promote failed: ${throwable.message}", TAG)
-                }.getOrDefault(false)
-                if (!promoted) {
-                    keepLegacy = newest
-                }
-            }
-        }
-
-        var deleted = 0
-        var failed = 0
-        var deletedBytes = 0L
-        legacyBackups.forEach { backup ->
-            if (backup == keepLegacy || !backup.exists()) {
-                return@forEach
-            }
-            val length = backup.length()
-            if (runCatching { backup.delete() }.getOrDefault(false)) {
-                deleted += 1
-                deletedBytes += length
-            } else {
-                failed += 1
-            }
-        }
-        if (deleted > 0 || failed > 0) {
-            val message =
-                "local license legacy backups cleanup deleted=$deleted failed=$failed " +
-                    "freedBytes=$deletedBytes fixed=${fixedBackup.exists()} dir=${parent.absolutePath}"
-            if (failed > 0) {
-                HookApi.w(message, TAG)
-            } else {
-                HookApi.i(message, TAG)
-            }
-        }
-    }
-
-    private fun backupLocalHiveForRewrite(hiveFile: File) {
-        val parent = hiveFile.parentFile ?: return
-        val backup = File(parent, HIVE_BACKUP_FILE_NAME)
+    private fun cleanupLegacyArtifacts(context: Context) {
         runCatching {
-            hiveFile.copyTo(backup, overwrite = true)
-            HookApi.i(
-                "local license rewrite backup updated bytes=${backup.length()} path=${backup.absolutePath}",
-                TAG,
-            )
+            val legacyRoot = File(context.filesDir, LEGACY_LOG_DIRECTORY)
+            if (legacyRoot.exists()) {
+                legacyRoot.walkBottomUp().forEach(File::delete)
+            }
+            val databaseDir = File(context.filesDir, "databases")
+            databaseDir.listFiles { file ->
+                file.isFile && (file.name.endsWith(".bak") || file.name.endsWith(".tmp"))
+            }?.forEach(File::delete)
         }.onFailure { throwable ->
-            HookApi.w("local license rewrite backup failed: ${throwable.message}", TAG)
+            HookApi.w("legacy artifact cleanup failed: ${throwable.message}", TAG)
         }
     }
 
@@ -511,7 +442,7 @@ object NetworkLicenseOverrideFeature {
             LocalLicenseStatus.REPAIRED -> {
                 val previousFailures = primaryMissingFailures.getAndSet(0)
                 primaryFirstMissingAt = 0L
-                if (!aotFallbackInstalled.get()) {
+                if (!aotFallbackInstalled.get() && !aotCompatibilityRequired.get()) {
                     aotFallbackArmed.set(false)
                     aotFallbackGeneration.incrementAndGet()
                 }
@@ -527,7 +458,7 @@ object NetworkLicenseOverrideFeature {
                 } else {
                     OrchestratorState.LOCAL_LICENSE_VALID
                 }
-                if (!aotFallbackInstalled.get()) {
+                if (!aotFallbackInstalled.get() && !aotFallbackArmed.get()) {
                     transitionTo(nextState, "license.${result.status.name.lowercase(Locale.US)}.${result.reason}")
                 }
             }
@@ -551,6 +482,9 @@ object NetworkLicenseOverrideFeature {
 
     private fun onNetworkGuardReady(reason: String) {
         if (aotFallbackInstalled.get()) {
+            return
+        }
+        if (aotCompatibilityRequired.get() && aotFallbackArmed.get()) {
             return
         }
         val nextState = when (orchestratorState) {
@@ -634,8 +568,7 @@ object NetworkLicenseOverrideFeature {
                     }
                     if (isAotFallbackStillArmed(generation) && !aotFallbackInstalled.get()) {
                         HookApi.e(
-                            "AOT fallback exhausted reason=$reason status=${NativePremiumUnlock.status()} " +
-                                "log=${HookApi.currentFileLogPaths().privatePath}",
+                            "AOT fallback exhausted reason=$reason status=${NativePremiumUnlock.status()}",
                             TAG,
                         )
                     }
@@ -645,7 +578,6 @@ object NetworkLicenseOverrideFeature {
                     }
                 }
             },
-            "ReedenHook-AotFallback",
         ).apply {
             isDaemon = true
             start()

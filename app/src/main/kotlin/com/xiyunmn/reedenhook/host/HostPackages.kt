@@ -6,8 +6,8 @@ package com.xiyunmn.reedenhook.host
  */
 object HostPackages {
     const val TARGET: String = "app.reeden"
-    const val VERSION_NAME: String = "1.37.1"
-    const val VERSION_CODE: Int = 694
+    const val VERSION_NAME: String = "1.38.1"
+    const val VERSION_CODE: Int = 733
 
     fun isTargetPackage(packageName: String): Boolean = packageName == TARGET
 

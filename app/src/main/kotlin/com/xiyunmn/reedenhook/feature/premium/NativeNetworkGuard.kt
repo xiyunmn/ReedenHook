@@ -1,6 +1,5 @@
 package com.xiyunmn.reedenhook.feature.premium
 
-import com.xiyunmn.reedenhook.core.HostFileLogger
 import com.xiyunmn.reedenhook.core.HookApi
 
 /**
@@ -19,12 +18,6 @@ object NativeNetworkGuard {
     @Volatile
     private var loadError: String? = null
 
-    @Volatile
-    private var privateLogPath: String? = null
-
-    @Volatile
-    private var appliedLogSignature: String? = null
-
     fun ensureLoaded(): Boolean {
         if (libraryLoaded) {
             return true
@@ -37,7 +30,6 @@ object NativeNetworkGuard {
                 System.loadLibrary("reeden_unlock")
                 libraryLoaded = true
                 loadError = null
-                applyFileLogPaths()
                 HookApi.i("NativeNetworkGuard library loaded", TAG)
                 true
             }.getOrElse { throwable ->
@@ -48,18 +40,10 @@ object NativeNetworkGuard {
         }
     }
 
-    fun configureFileLogging(paths: HostFileLogger.Paths) {
-        privateLogPath = paths.privatePath
-        if (libraryLoaded) {
-            applyFileLogPaths()
-        }
-    }
-
     fun install(reason: String): Int {
         if (!ensureLoaded()) {
             return -100
         }
-        applyFileLogPaths()
         return runCatching {
             val code = nativeInstall()
             HookApi.i("NativeNetworkGuard install reason=$reason code=$code status=${status()}", TAG)
@@ -92,22 +76,8 @@ object NativeNetworkGuard {
         return runCatching { nativeStatus() }.getOrDefault("status unavailable")
     }
 
-    private fun applyFileLogPaths() {
-        if (!libraryLoaded) {
-            return
-        }
-        val signature = privateLogPath.orEmpty()
-        if (appliedLogSignature == signature) {
-            return
-        }
-        runCatching { nativeSetFileLogPaths(privateLogPath, null) }
-            .onSuccess { appliedLogSignature = signature }
-            .onFailure { HookApi.e("NativeNetworkGuard file log config failed", TAG, it) }
-    }
-
     private external fun nativeInstall(): Int
     private external fun nativeSetEnabled(enabled: Boolean)
     private external fun nativeIsInstalled(): Boolean
     private external fun nativeStatus(): String
-    private external fun nativeSetFileLogPaths(privatePath: String?, externalPath: String?)
 }

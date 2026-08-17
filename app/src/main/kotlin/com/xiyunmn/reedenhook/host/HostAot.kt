@@ -70,7 +70,7 @@ object HostAot {
     const val LICENSE_HOST_CN: String = "https://license-cn.reeden.app/api"
 
     /** Synthetic license payload for local unlock research (GZc JSON keys). */
-    const val FORGE_EMAIL: String = "reedenhook@local"
-    const val FORGE_LICENSE_KEY: String = "RH-LOCAL-UNLOCK-1.37.1"
-    const val FORGE_ORDER_ID: String = "reedenhook-local"
+    const val FORGE_EMAIL: String = "local-license@invalid"
+    const val FORGE_LICENSE_KEY: String = "RH-LOCAL-UNLOCK-1.38.1"
+    const val FORGE_ORDER_ID: String = "local-order-v1381"
 }

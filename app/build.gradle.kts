@@ -11,12 +11,12 @@ android {
         applicationId = "com.xiyunmn.reedenhook"
         minSdk = 26
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.5.2"
+        versionCode = 14
+        versionName = "0.6.0"
 
         buildConfigField("String", "HOST_PACKAGE", "\"app.reeden\"")
-        buildConfigField("String", "HOST_VERSION_NAME", "\"1.37.1\"")
-        buildConfigField("int", "HOST_VERSION_CODE", "694")
+        buildConfigField("String", "HOST_VERSION_NAME", "\"1.38.1\"")
+        buildConfigField("int", "HOST_VERSION_CODE", "733")
 
         ndk {
             abiFilters += listOf("arm64-v8a")

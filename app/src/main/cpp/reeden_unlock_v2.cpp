@@ -25,130 +25,7 @@
 
 namespace {
 
-constexpr size_t kNativeLogPathCount = 1;
-constexpr size_t kNativeLogPathMax = 512;
-constexpr size_t kNativeLogLineMax = 1536;
-constexpr off_t kNativeLogMaxBytes = 256 * 1024;
-constexpr size_t kNativeLogMaxFiles = 3;
-
-std::mutex g_native_log_mu;
-char g_native_log_paths[kNativeLogPathCount][kNativeLogPathMax] = {};
-
-pid_t current_tid() {
-    return static_cast<pid_t>(syscall(__NR_gettid));
-}
-
-void write_all(int fd, const char *data, size_t len) {
-    while (len > 0) {
-        const ssize_t written = write(fd, data, len);
-        if (written <= 0) {
-            return;
-        }
-        data += written;
-        len -= static_cast<size_t>(written);
-    }
-}
-
-void cleanup_excess_native_logs(const char *path) {
-    for (size_t index = kNativeLogMaxFiles; index <= 16; ++index) {
-        char extra[kNativeLogPathMax + 8] {};
-        const int len = snprintf(extra, sizeof(extra), "%s.%zu", path, index);
-        if (len <= 0 || static_cast<size_t>(len) >= sizeof(extra)) {
-            continue;
-        }
-        unlink(extra);
-    }
-}
-
-void rotate_native_log_if_needed(const char *path, size_t incoming_bytes) {
-    struct stat st {};
-    if (stat(path, &st) != 0 ||
-        st.st_size + static_cast<off_t>(incoming_bytes) <= kNativeLogMaxBytes) {
-        return;
-    }
-
-    cleanup_excess_native_logs(path);
-    for (size_t index = kNativeLogMaxFiles - 1; index > 0; --index) {
-        char source[kNativeLogPathMax + 8] {};
-        char target[kNativeLogPathMax + 8] {};
-        const int source_len = index == 1 ?
-            snprintf(source, sizeof(source), "%s", path) :
-            snprintf(source, sizeof(source), "%s.%zu", path, index - 1);
-        const int target_len = snprintf(target, sizeof(target), "%s.%zu", path, index);
-        if (source_len <= 0 || target_len <= 0 ||
-            static_cast<size_t>(source_len) >= sizeof(source) ||
-            static_cast<size_t>(target_len) >= sizeof(target)) {
-            continue;
-        }
-        unlink(target);
-        rename(source, target);
-    }
-}
-
-void append_native_file_log(const char *level, const char *message) {
-    char paths[kNativeLogPathCount][kNativeLogPathMax] {};
-    {
-        std::lock_guard<std::mutex> lock(g_native_log_mu);
-        for (size_t i = 0; i < kNativeLogPathCount; ++i) {
-            snprintf(paths[i], sizeof(paths[i]), "%s", g_native_log_paths[i]);
-        }
-    }
-
-    bool has_path = false;
-    for (size_t i = 0; i < kNativeLogPathCount; ++i) {
-        if (paths[i][0] != '\0') {
-            has_path = true;
-            break;
-        }
-    }
-    if (!has_path) {
-        return;
-    }
-
-    struct timespec ts {};
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm_value {};
-    localtime_r(&ts.tv_sec, &tm_value);
-    char stamp[32] {};
-    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_value);
-
-    char line[kNativeLogLineMax] {};
-    const int line_len = snprintf(
-        line,
-        sizeof(line),
-        "%s.%03ld %s/%s(%d:%d): %s\n",
-        stamp,
-        ts.tv_nsec / 1000000L,
-        level,
-        LOG_TAG,
-        getpid(),
-        current_tid(),
-        message ? message : "");
-    if (line_len <= 0) {
-        return;
-    }
-    const size_t bytes =
-        static_cast<size_t>(line_len) < sizeof(line) ?
-        static_cast<size_t>(line_len) :
-        sizeof(line) - 1;
-
-    std::lock_guard<std::mutex> lock(g_native_log_mu);
-    for (size_t i = 0; i < kNativeLogPathCount; ++i) {
-        const char *path = g_native_log_paths[i];
-        if (path[0] == '\0') {
-            continue;
-        }
-        rotate_native_log_if_needed(path, bytes);
-        const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (fd < 0) {
-            continue;
-        }
-        write_all(fd, line, bytes);
-        close(fd);
-    }
-}
-
-void log_message(int priority, const char *level, const char *fmt, ...) {
+void log_message(int priority, const char *fmt, ...) {
     char message[1024] {};
     va_list args;
     va_start(args, fmt);
@@ -156,12 +33,11 @@ void log_message(int priority, const char *level, const char *fmt, ...) {
     va_end(args);
 
     __android_log_print(priority, LOG_TAG, "%s", message);
-    append_native_file_log(level, message);
 }
 
-#define LOGI(...) log_message(ANDROID_LOG_INFO, "I", __VA_ARGS__)
-#define LOGW(...) log_message(ANDROID_LOG_WARN, "W", __VA_ARGS__)
-#define LOGE(...) log_message(ANDROID_LOG_ERROR, "E", __VA_ARGS__)
+#define LOGI(...) log_message(ANDROID_LOG_INFO, __VA_ARGS__)
+#define LOGW(...) log_message(ANDROID_LOG_WARN, __VA_ARGS__)
+#define LOGE(...) log_message(ANDROID_LOG_ERROR, __VA_ARGS__)
 
 // Single-pass native unlock strategy (v0.4.6):
 //
@@ -1221,37 +1097,6 @@ void do_uninstall_locked() {
     LOGI("uninstalled and restored patches");
 }
 
-void set_native_log_path(JNIEnv *env, jstring value, size_t index) {
-    if (index >= kNativeLogPathCount) {
-        return;
-    }
-    const char *chars = nullptr;
-    if (value != nullptr) {
-        chars = env->GetStringUTFChars(value, nullptr);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_native_log_mu);
-        if (chars != nullptr && chars[0] != '\0') {
-            snprintf(g_native_log_paths[index], kNativeLogPathMax, "%s", chars);
-        } else {
-            g_native_log_paths[index][0] = '\0';
-        }
-    }
-
-    if (chars != nullptr) {
-        env->ReleaseStringUTFChars(value, chars);
-    }
-}
-
-void native_log_paths_snapshot(char *primary, size_t primary_size, char *mirror, size_t mirror_size) {
-    std::lock_guard<std::mutex> lock(g_native_log_mu);
-    snprintf(primary, primary_size, "%s", g_native_log_paths[0]);
-    if (mirror_size > 0) {
-        mirror[0] = '\0';
-    }
-}
-
 }  // namespace
 
 extern "C" JNIEXPORT jint JNICALL
@@ -1313,25 +1158,6 @@ Java_com_xiyunmn_reedenhook_feature_premium_NativePremiumUnlock_nativeStatus(
     return env->NewStringUTF(buf);
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeSetFileLogPaths(
-    JNIEnv *env,
-    jclass,
-    jstring private_path,
-    jstring external_path) {
-    (void) external_path;
-    set_native_log_path(env, private_path, 0);
-
-    char primary[kNativeLogPathMax] {};
-    char mirror[kNativeLogPathMax] {};
-    native_log_paths_snapshot(primary, sizeof(primary), mirror, sizeof(mirror));
-    LOGI(
-        "network guard file logging configured private=%s maxBytes=%lld maxFiles=%zu",
-        primary[0] != '\0' ? primary : "n/a",
-        static_cast<long long>(kNativeLogMaxBytes),
-        kNativeLogMaxFiles);
-}
-
 extern "C" JNIEXPORT jint JNICALL
 Java_com_xiyunmn_reedenhook_feature_premium_NativeNetworkGuard_nativeInstall(
     JNIEnv *,
@@ -1384,6 +1210,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
-    LOGI("JNI_OnLoad reeden_unlock v0.5.2 network guard with AOT fallback available");
+    LOGI("JNI_OnLoad reeden_unlock v0.6.0 network guard with AOT fallback available");
     return JNI_VERSION_1_6;
 }
